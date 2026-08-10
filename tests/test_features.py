@@ -41,7 +41,7 @@ from pathlib import Path
 
 import pytest
 
-from src.ingestion import RUNS_COLUMNS, RUNS_SCHEMA_DDL, STATUS_FAILED, STATUS_SUCCEEDED
+from src.ingestion import STATUS_FAILED, STATUS_SUCCEEDED
 from src.pipelines import EXCHANGE_TZ_NAME, feature_pipeline, silver_news, silver_prices
 from src.pipelines.feature_pipeline import (
     FEATURE_COLUMNS,
@@ -70,6 +70,7 @@ from src.pipelines.feature_pipeline import (
     trading_sessions,
     volume_zscore_expr,
 )
+from tests.conftest import FakeResult, FakeSpark
 
 CATALOG = "market_intel"
 UTC = timezone.utc
@@ -659,92 +660,6 @@ def test_daily_features_ddl_declares_the_merge_keys_not_null():
 # ------------------------------------------------------------- ingestion_runs ledger
 
 
-class _FakeResult:
-    def __init__(self, row: dict | None = None, rows: list | None = None):
-        self._row = row
-        self._rows = rows or []
-
-    def first(self):
-        return self._row
-
-    def collect(self):
-        return self._rows
-
-
-class _FakeFrame:
-    def __init__(self, spark: "_FakeSpark", rows: list, schema: str):
-        self._spark = spark
-        self.rows = rows
-        self.schema = schema
-
-    def createOrReplaceTempView(self, name: str) -> None:  # noqa: N802 — Spark's API
-        self._spark.views[name] = self
-
-
-class _FakeCatalog:
-    def __init__(self, spark: "_FakeSpark"):
-        self._spark = spark
-
-    def tableExists(self, fqn: str) -> bool:  # noqa: N802 — Spark's API
-        return fqn not in self._spark.missing_tables
-
-    def dropTempView(self, name: str) -> None:  # noqa: N802 — Spark's API
-        self._spark.views.pop(name, None)
-
-
-class _FakeConf:
-    def __init__(self):
-        self.values: dict[str, str] = {}
-
-    def get(self, key: str, default: str | None = None) -> str | None:
-        return self.values.get(key, default)
-
-    def set(self, key: str, value: str) -> None:
-        self.values[key] = value
-
-
-class _FakeSpark:
-    """Enough of a SparkSession to run a pipeline's ``main`` and inspect what it wrote.
-
-    This is not a substitute for running against Delta — the SQL is never parsed — but the ledger
-    contract is Python control flow, not SQL, and that is what these tests pin: one row per call,
-    on success and on failure, with the right task name.
-    """
-
-    def __init__(self, *, row_count: int = 7, fail_on: str | None = None):
-        self.catalog = _FakeCatalog(self)
-        self.conf = _FakeConf()
-        self.views: dict[str, _FakeFrame] = {}
-        self.missing_tables: set[str] = set()
-        self.statements: list[str] = []
-        self.frames: list[_FakeFrame] = []
-        self._row_count = row_count
-        self._fail_on = fail_on
-
-    def sql(self, text: str, args: dict | None = None) -> _FakeResult:
-        self.statements.append(text)
-        if self._fail_on and self._fail_on in text:
-            raise RuntimeError("boom: simulated Spark failure")
-        if "min(trade_date)" in text:
-            return _FakeResult({"first_date": date(2026, 8, 3), "last_date": date(2026, 8, 14)})
-        if "count(*) AS n FROM" in text:
-            return _FakeResult({"n": self._row_count})
-        return _FakeResult()
-
-    def createDataFrame(self, rows, schema: str) -> _FakeFrame:  # noqa: N802 — Spark's API
-        frame = _FakeFrame(self, list(rows), schema)
-        self.frames.append(frame)
-        return frame
-
-    def ledger_rows(self) -> list[dict]:
-        return [
-            dict(zip(RUNS_COLUMNS, row))
-            for frame in self.frames
-            if frame.schema == RUNS_SCHEMA_DDL
-            for row in frame.rows
-        ]
-
-
 @pytest.mark.parametrize(
     ("module", "expected_task"),
     [
@@ -754,7 +669,7 @@ class _FakeSpark:
     ],
 )
 def test_every_pipeline_task_writes_one_ledger_row_on_success(module, expected_task: str):
-    spark = _FakeSpark(row_count=7)
+    spark = FakeSpark(row_count=7)
 
     summary = module.main(spark, {"catalog": CATALOG})
     rows = spark.ledger_rows()
@@ -775,7 +690,7 @@ def test_every_pipeline_task_writes_one_ledger_row_on_success(module, expected_t
 )
 def test_every_pipeline_task_writes_a_failed_ledger_row_and_reraises(module):
     # Fail inside the build, before the ledger's own write, so the ledger row still lands.
-    spark = _FakeSpark(fail_on="count(*) AS n FROM")
+    spark = FakeSpark(fail_on="count(*) AS n FROM")
 
     with pytest.raises(RuntimeError, match="simulated Spark failure"):
         module.main(spark, {"catalog": CATALOG})
@@ -792,7 +707,7 @@ def test_every_pipeline_task_writes_a_failed_ledger_row_and_reraises(module):
     [silver_prices, silver_news, feature_pipeline],
 )
 def test_every_pipeline_task_stamps_a_utc_window_on_its_ledger_row(module):
-    spark = _FakeSpark()
+    spark = FakeSpark()
 
     module.main(spark, {"catalog": CATALOG})
     row = spark.ledger_rows()[0]
@@ -810,7 +725,7 @@ def test_ledger_task_names_are_documented_in_the_ddl():
 
 
 def test_feature_pipeline_pins_the_session_timezone_to_utc():
-    spark = _FakeSpark()
+    spark = FakeSpark()
 
     feature_pipeline.main(spark, {"catalog": CATALOG})
 
@@ -818,7 +733,7 @@ def test_feature_pipeline_pins_the_session_timezone_to_utc():
 
 
 def test_feature_pipeline_registers_both_calendar_views():
-    spark = _FakeSpark()
+    spark = FakeSpark()
 
     feature_pipeline.main(spark, {"catalog": CATALOG})
 
@@ -830,7 +745,7 @@ def test_feature_pipeline_registers_both_calendar_views():
 
 
 def test_feature_pipeline_skips_the_build_when_prices_are_empty():
-    spark = _FakeSpark()
+    spark = FakeSpark()
     spark.sql = _empty_prices_sql(spark)  # type: ignore[method-assign]
 
     summary = feature_pipeline.main(spark, {"catalog": CATALOG})
@@ -843,7 +758,7 @@ def test_feature_pipeline_skips_the_build_when_prices_are_empty():
 
 
 def test_feature_pipeline_fails_with_an_actionable_message_when_a_table_is_missing():
-    spark = _FakeSpark()
+    spark = FakeSpark()
     spark.missing_tables.add(f"{CATALOG}.silver.daily_features")
 
     with pytest.raises(RuntimeError, match="daily_features"):
@@ -852,13 +767,13 @@ def test_feature_pipeline_fails_with_an_actionable_message_when_a_table_is_missi
     assert spark.ledger_rows()[0]["status"] == STATUS_FAILED
 
 
-def _empty_prices_sql(spark: _FakeSpark):
+def _empty_prices_sql(spark: FakeSpark):
     original = spark.sql
 
     def sql(text: str, args: dict | None = None):
         if "min(trade_date)" in text:
             spark.statements.append(text)
-            return _FakeResult({"first_date": None, "last_date": None})
+            return FakeResult({"first_date": None, "last_date": None})
         return original(text, args)
 
     return sql

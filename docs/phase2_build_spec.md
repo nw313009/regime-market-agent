@@ -110,7 +110,15 @@ regime-market-agent/
 ├── setup/          create_catalog.sql | create_delta_tables.sql |
 │                   create_lakebase.sql | create_ai_search.py |
 │                   create_workflow.py | seed_demo_data.py
-├── sql/            (DDL kept in sync with setup/)
+├── sql/            (intentionally EMPTY — see sql/README.md)
+│                   # v1.0 planned this as a reviewable mirror of setup/'s DDL. Dropped at B-6:
+│                   # a hand-copied second definition with no test keeping it honest drifts, and
+│                   # a drifted DDL reference is worse than none — it is the file a reader trusts
+│                   # while the cluster runs the other one. setup/create_delta_tables.sql is the
+│                   # single source and is written to be read (a COMMENT on every column); the
+│                   # tests parse it and assert the columns, NOT NULL MERGE keys and ledger task
+│                   # names match the code, which a mirror could not do. Section 15 (environment
+│                   # recreatable from code) is satisfied by setup/ alone.
 ├── tests/          test_features.py | test_models.py | test_monte_carlo.py |
 │                   test_no_lookahead.py | test_agent_tools.py | test_idempotency.py |
 │                   test_massive_client.py | test_ingestion.py | test_silver.py |

@@ -21,12 +21,18 @@
 --
 -- gold.regime_states      ticker, as_of_date, prob_low_vol, prob_high_vol, low/high mean and
 --                         sigma, current_news_signal, model_used, model_version
+--                                                      MERGE (ticker, as_of_date)
 -- gold.forecast_runs      forecast_id, ticker, generated_at, as_of_date, horizon_days,
 --                         model_used, current_price, price_p10/50/90, return_p10/50/90,
 --                         prob_positive, prob_loss_gt_5pct, prob_low_vol, prob_high_vol,
 --                         n_paths, seed, model_version
+--                                                      MERGE (ticker, as_of_date, model_used)
 -- gold.backtest_metrics   origin_date, ticker, model, brier, mae, covered_80 (bool),
---                         model_used, converged; plus a pooled_summary view/table carrying n
+--                         model_used, converged, failure_reason + the inputs behind the scores
+--                                                      MERGE (origin_date, ticker, model)
+-- gold.backtest_summary   the pooled summary carrying n: model, n, n_tickers, brier, mae,
+--                         coverage_80, fallback_rate, computed_at.
+--                                                      MERGE (model)
 -- gold.model_calls        ts, task, model, latency_ms, ok, in_tokens, out_tokens
 --
 -- These tables are tiny (~2.5k rows per ticker). Do not partition them.
@@ -101,7 +107,7 @@ COMMENT 'Near-raw Massive news, one row per (article, insight). MERGE on (articl
 -- exception text can carry a credential into a queryable table (A-1 security rule).
 CREATE TABLE IF NOT EXISTS market_intel.bronze.ingestion_runs (
   run_id       STRING    NOT NULL COMMENT 'UUID4 for this run. MERGE key.',
-  task         STRING    NOT NULL COMMENT 'Task name: ingest_prices | ingest_news | build_silver_prices | build_silver_news | build_features.',
+  task         STRING    NOT NULL COMMENT 'Task name: ingest_prices | ingest_news | build_silver_prices | build_silver_news | build_features | fit_models | run_forecasts | run_backtest. The last three write gold (B-6) through the same ledgered path; run_backtest is on demand, not part of the daily workflow.',
   started_at   TIMESTAMP          COMMENT 'UTC start.',
   finished_at  TIMESTAMP          COMMENT 'UTC end, set on success AND on failure.',
   status       STRING             COMMENT 'succeeded | failed.',
@@ -187,5 +193,129 @@ USING DELTA
 COMMENT 'Model-ready features, grain (ticker, trade_date) on XNYS sessions. MERGE on (ticker, trade_date) — never a blind INSERT.';
 
 -- =====================================================================================
--- GOLD (B-6, C-3) — TODO: implement at checkpoint B-6.
+-- GOLD (B-6) — implemented
 -- =====================================================================================
+-- Gold is what the app and the agent read. Nothing in it is computed at read time: the modeling
+-- layer produces every number in pandas and src/pipelines/write_gold MERGEs it here, so the
+-- Streamlit pages and the agent tools are pure readers (the agent NEVER computes statistics).
+--
+-- SCALES. Every rate in gold is a DECIMAL fraction, never a percent: return_p10 = -0.031 means
+-- -3.1%, and the regime means and sigmas match. Estimation happens in percent log returns (B-0)
+-- and the divide-by-100 happens before anything is stored, so one display format applies to the
+-- whole layer.
+--
+-- MERGE KEYS ARE THE ROW'S IDENTITY, not its surrogate id. forecast_runs keys on
+-- (ticker, as_of_date, model_used) rather than forecast_id: a UUID key can never match an existing
+-- row, which would silently turn the required MERGE back into a blind INSERT and duplicate a day's
+-- forecast on every retry. forecast_id is instead DERIVED from those same three values (uuid5), so
+-- it is stable across re-runs and a saved research report's forecast_id keeps resolving.
+--
+-- NULL MEANS "NOT APPLICABLE" HERE, and it is used deliberately: prob_low_vol/prob_high_vol are
+-- NULL on a GBM forecast because a model without regimes has no regime probability, and
+-- backtest_metrics.converged is NULL for GBM because there is no optimizer to converge. Writing
+-- 0.0 or true instead would be a claim rather than an absence.
+
+-- The current regime read, one row per ticker per day. This is the "High volatility — 73%" card.
+-- prob_low_vol/prob_high_vol are FILTERED probabilities (data through as_of_date only), never
+-- smoothed: smoothed probabilities use the whole sample and would make this card a hindsight
+-- statement (architecture doc section 5).
+CREATE TABLE IF NOT EXISTS market_intel.gold.regime_states (
+  ticker              STRING NOT NULL COMMENT 'MERGE key 1.',
+  as_of_date          DATE   NOT NULL COMMENT 'Last trade_date included in the fit. MERGE key 2.',
+  prob_low_vol        DOUBLE          COMMENT 'Filtered probability of the calm regime at as_of_date. Filtered, never smoothed.',
+  prob_high_vol       DOUBLE          COMMENT 'Filtered probability of the turbulent regime. Sums to 1 with prob_low_vol.',
+  low_vol_mean        DOUBLE          COMMENT 'Fitted daily mean log return of the calm regime, DECIMAL scale (0.0004 = 0.04%).',
+  low_vol_sigma       DOUBLE          COMMENT 'Fitted daily sigma of the calm regime, DECIMAL scale. Always <= high_vol_sigma: regimes are re-sorted by fitted variance after every fit.',
+  high_vol_mean       DOUBLE          COMMENT 'Fitted daily mean log return of the turbulent regime, DECIMAL scale.',
+  high_vol_sigma      DOUBLE          COMMENT 'Fitted daily sigma of the turbulent regime, DECIMAL scale.',
+  current_news_signal DOUBLE          COMMENT 'news_sentiment_3d at as_of_date, the value the forecast decays over the horizon. In [-1, 1].',
+  model_used          STRING          COMMENT 'Rung that actually produced this row: news_markov | markov | gbm. Records the C->B->A fallback rather than hiding it.',
+  model_version       STRING          COMMENT 'Version of the modeling code, so stored rows stay comparable across changes.'
+)
+USING DELTA
+COMMENT 'Current regime read per ticker. MERGE on (ticker, as_of_date) — never a blind INSERT.';
+
+-- One forecast distribution per ticker per day per model. A DISTRIBUTION, not a point prediction:
+-- the quantiles and the probabilities are the product, and the 5,000 raw paths are deliberately
+-- NOT stored (B-4).
+CREATE TABLE IF NOT EXISTS market_intel.gold.forecast_runs (
+  forecast_id       STRING NOT NULL COMMENT 'Stable uuid5 of (ticker, as_of_date, model_used). Referenced by research_reports.forecast_id in Lakebase (C-2), so it must not change on a re-run.',
+  ticker            STRING NOT NULL COMMENT 'MERGE key 1.',
+  generated_at      TIMESTAMP       COMMENT 'UTC wall-clock when the simulation ran. Not a key: re-running the same day updates this in place.',
+  as_of_date        DATE   NOT NULL COMMENT 'Last trade_date the forecast was conditioned on. MERGE key 2.',
+  horizon_days      INT             COMMENT 'Forecast horizon in trading days (config forecast.horizon_days = 5).',
+  model_used        STRING NOT NULL COMMENT 'news_markov | markov | gbm — the rung that produced this row. MERGE key 3, so all three models can be stored for one day and compared.',
+  current_price     DOUBLE          COMMENT 'Close at as_of_date, the price every path starts from.',
+  price_p10         DOUBLE          COMMENT '10th percentile simulated price at the horizon.',
+  price_p50         DOUBLE          COMMENT 'Median simulated price at the horizon.',
+  price_p90         DOUBLE          COMMENT '90th percentile simulated price at the horizon.',
+  return_p10        DOUBLE          COMMENT '10th percentile horizon return, DECIMAL (-0.031 = -3.1%). Derived from price_p10 so the two can never disagree.',
+  return_p50        DOUBLE          COMMENT 'Median horizon return, DECIMAL.',
+  return_p90        DOUBLE          COMMENT '90th percentile horizon return, DECIMAL. [return_p10, return_p90] is the 80% interval the backtest scores coverage against.',
+  prob_positive     DOUBLE          COMMENT 'Share of paths with a positive horizon return, i.e. P(R5 > 0). The quantity the Brier score scores.',
+  prob_loss_gt_5pct DOUBLE          COMMENT 'Share of paths with a horizon return below -5%, i.e. P(R5 < -0.05), strictly worse than a 5% loss.',
+  prob_low_vol      DOUBLE          COMMENT 'Filtered probability of the calm regime the paths were initialized from. NULL for gbm, which has no regimes.',
+  prob_high_vol     DOUBLE          COMMENT 'Filtered probability of the turbulent regime. NULL for gbm.',
+  n_paths           INT             COMMENT 'Simulated paths (config forecast.n_paths = 5000). Stored because a percentile without its sample size is not interpretable.',
+  seed              BIGINT          COMMENT 'Seed of the single numpy Generator used for this run. With model_version, this makes the row reproducible.',
+  model_version     STRING          COMMENT 'Version of the simulation code. Bump it when a change makes stored forecasts non-comparable — a different draw order counts.'
+)
+USING DELTA
+COMMENT 'Forecast distributions. MERGE on (ticker, as_of_date, model_used) — never a blind INSERT.';
+
+-- Walk-forward backtest, one row per (origin, ticker, model). Written by the on-demand backtest
+-- job, NOT by the daily workflow.
+--
+-- model vs model_used is the whole fallback story: model is the arm that was asked for, model_used
+-- is the rung that answered after the C->B->A descent. The fallback rate the Model Evaluation page
+-- shows is simply how often they differ.
+--
+-- realized_return, return_p50 and prob_positive are stored beyond the spec's column list so a
+-- published score can be recomputed from the row that claims it. A Brier score with no record of
+-- the probability and the outcome behind it cannot be audited.
+CREATE TABLE IF NOT EXISTS market_intel.gold.backtest_metrics (
+  origin_date     DATE    NOT NULL COMMENT 'Origin T: the last session in the training window. MERGE key 1.',
+  ticker          STRING  NOT NULL COMMENT 'MERGE key 2.',
+  model           STRING  NOT NULL COMMENT 'Arm evaluated: news_markov | markov | gbm. All three fit on the IDENTICAL training window at each origin (parity rule). MERGE key 3.',
+  brier           DOUBLE           COMMENT 'Squared error of prob_positive against the realized direction. 0 is perfect, 0.25 is an honest coin flip.',
+  mae             DOUBLE           COMMENT 'At this grain, the ABSOLUTE error of return_p50 against realized_return. The pooled summary averages these into a mean absolute error.',
+  covered_80      BOOLEAN          COMMENT 'Whether realized_return fell inside [return_p10, return_p90], inclusive. Should be true about 80% of the time; over-coverage is as much a failure as under-coverage.',
+  model_used      STRING           COMMENT 'Rung that actually produced the forecast. Differs from model exactly when the ladder fell back.',
+  converged       BOOLEAN          COMMENT 'Whether the optimizer converged. NULL for gbm, which has no optimizer.',
+  failure_reason  STRING           COMMENT 'Recorded reason for every rung that failed above model_used, or NULL. A silent fallback is as bad as a crash.',
+  realized_return DOUBLE           COMMENT 'Actual horizon return from origin_date, DECIMAL. Used for scoring only — never for fitting.',
+  return_p50      DOUBLE           COMMENT 'Forecast median return, kept so mae can be recomputed from this row.',
+  prob_positive   DOUBLE           COMMENT 'Forecast P(R5 > 0), kept so brier can be recomputed from this row.'
+)
+USING DELTA
+COMMENT 'Walk-forward backtest scores. MERGE on (origin_date, ticker, model) — never a blind INSERT.';
+
+-- The pooled summary the Model Evaluation page reads: one row per model, across every origin and
+-- ticker of the most recent backtest run.
+--
+-- A TABLE rather than a view, deliberately. The pooled metrics are already computed in pandas by
+-- src/models/backtest.pooled_summary, and a SQL view would be a SECOND implementation of the same
+-- three averages — two implementations of one number is how a page and its evidence start
+-- disagreeing. So the aggregation exists once, in tested Python, and this table stores its output.
+--
+-- n IS MANDATORY ON THE PAGE. 26 weekly origins across 5 tickers is 130 forecasts per model, which
+-- is a small sample for a Brier difference. "No meaningful improvement detected at this sample
+-- size" is a first-class verdict (spec A2), and it cannot be stated honestly without n.
+CREATE TABLE IF NOT EXISTS market_intel.gold.backtest_summary (
+  model         STRING NOT NULL COMMENT 'news_markov | markov | gbm. MERGE key: one current pooled row per model, replaced by the next backtest run.',
+  n             BIGINT          COMMENT 'Scored (origin, ticker) forecasts behind these numbers. ALWAYS displayed on the Model Evaluation page.',
+  n_tickers     INT             COMMENT 'Distinct tickers pooled, so a large n from one ticker is distinguishable from a broad one.',
+  brier         DOUBLE          COMMENT 'Mean Brier score over the n forecasts. Lower is better.',
+  mae           DOUBLE          COMMENT 'Mean absolute error of the median return, DECIMAL.',
+  coverage_80   DOUBLE          COMMENT 'Share of outcomes inside the 80% interval. The target is 0.80, from either direction.',
+  fallback_rate DOUBLE          COMMENT 'Share of origins where this arm fell back to a simpler rung. 0 for gbm, which is the bottom of the ladder. Displayed alongside n.',
+  computed_at   TIMESTAMP       COMMENT 'UTC wall-clock of the backtest run that produced this row, so the page can say how stale the verdict is.'
+)
+USING DELTA
+COMMENT 'Pooled backtest summary, one row per model. MERGE on (model) — never a blind INSERT.';
+
+-- =====================================================================================
+-- GOLD (C-3) — TODO: implement at checkpoint C-3.
+-- =====================================================================================
+-- gold.model_calls   ts, task, model, latency_ms, ok, in_tokens, out_tokens — LLM telemetry,
+--                    appended by src/llm/telemetry.py. Lands with call_model at C-3.

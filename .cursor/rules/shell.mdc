@@ -1,0 +1,27 @@
+---
+description: Always run shell commands in this repo through git bash, never PowerShell
+alwaysApply: true
+---
+
+# Use git bash for every shell command
+
+The workspace default shell is PowerShell, which rejects `&&`, `2>/dev/null`, `$(...)` and
+single-quoted Python one-liners. Do not fight it — always invoke git bash instead.
+
+Wrap every command like this:
+
+```
+& "C:\Program Files\Git\bin\bash.exe" -lc "cd /c/CodeProjectsLocal/regime-market-agent && <command>"
+```
+
+- Use bash syntax inside the quotes: `&&` for chaining, forward slashes for paths, `/c/...` for
+  drive roots.
+- Escape inner double quotes, or prefer single quotes inside the bash string.
+- If a command needs complex quoting (a Python `-c` snippet, a heredoc), write a script file and
+  run the file instead of fighting two layers of quoting.
+
+Run Python through the repo venv: `.venv/Scripts/python.exe`, e.g.
+`.venv/Scripts/python.exe -m pytest tests -q`.
+
+Never use PowerShell-only constructs (`$env:`, `Select-Object`, backtick line continuation), and
+never chain with a bare `;` expecting PowerShell to behave like bash.
