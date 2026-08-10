@@ -13,8 +13,13 @@ streamlit==1.61.1
 # Delta reads over the serverless SQL warehouse declared in app/app.yaml.
 databricks-sql-connector==4.4.0
 
-# Lakebase (Postgres): watchlist and saved reports.
-psycopg2-binary==2.9.12
+# Lakebase (Postgres): watchlist and saved reports. psycopg v3 with the pool extra, because
+# the app holds a long-lived ConnectionPool whose connections each carry their own OAuth token.
+psycopg[binary,pool]==3.3.4
+
+# Required by the Lakebase connection pattern: the app's service principal calls
+# w.postgres.generate_database_credential to authenticate each connection.
+databricks-sdk>=0.125.0
 
 # config/config.yaml loading.
 PyYAML==6.0.3

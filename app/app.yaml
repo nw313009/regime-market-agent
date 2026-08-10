@@ -22,12 +22,23 @@ env:
   - name: CATALOG
     value: "market_intel"
 
-  # Lakebase (Postgres) connection, read by src/database/lakebase.py via psycopg2.
+  # Lakebase (Postgres) connection, read by src/database/lakebase.py through the pooled
+  # psycopg v3 pattern in db.py. There is NO password env var: each connection authenticates
+  # with a short-lived credential from w.postgres.generate_database_credential, using the app's
+  # own service principal identity.
+  #
+  # Instance: the capstone's own Lakebase project regime-market-database (Autoscaling, Postgres
+  # branch production, endpoint primary).
+  #
+  # TODO before first deploy: create the Postgres role for this app's service principal via the
+  # regime-market-database project's OAuth tab, then grant it USAGE on schema market_system plus
+  # table privileges. Missing grants look like an application bug at deploy time; they are not.
   - name: LAKEBASE_HOST
     value: "REPLACE_ME_lakebase_host"
   - name: LAKEBASE_PORT
     value: "5432"
   - name: LAKEBASE_DATABASE
     value: "REPLACE_ME_lakebase_database"
-  - name: LAKEBASE_USER
-    value: "REPLACE_ME_lakebase_user"
+  # Schema the capstone's tables live in. Every query fully qualifies it.
+  - name: LAKEBASE_SCHEMA
+    value: "market_system"

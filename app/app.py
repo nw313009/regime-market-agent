@@ -5,7 +5,8 @@ Three pages live in ``app/pages/``: Market Research, Research Agent, Model Evalu
 Data access:
 
 - Delta through ``databricks-sql-connector`` against a serverless SQL warehouse.
-- Lakebase through ``psycopg2``.
+- Lakebase through the psycopg v3 pool in ``src/database/lakebase.py``, which authenticates
+  each connection with a short-lived OAuth credential rather than a stored password.
 
 There is no SparkSession in a Databricks App, which is why the app reads the small Gold
 result set over SQL rather than through Spark.

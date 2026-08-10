@@ -1,18 +1,40 @@
 -- Lakebase (Postgres) schema for application state (spec C-2). Keep in sync with sql/.
 --
---   users(user_id, display_name, created_at)
---   watchlists(watchlist_id, user_id, name, created_at)
---   watchlist_tickers(watchlist_id, ticker, added_at, added_by,
---                     PRIMARY KEY (watchlist_id, ticker))
---   research_reports(report_id, user_id, ticker, question, report_md, forecast_id,
---                    created_at)
+-- Instance: the capstone has its OWN Lakebase project, regime-market-database (Autoscaling,
+-- Postgres branch production, endpoint primary). It does not share the instance hosting
+-- ticket_system and weather_system.
+--
+-- Schema: tables still live in their own schema, market_system. Create the schema first, then
+-- the four tables inside it, and fully qualify the schema in every query. A dedicated project
+-- removes the collision risk but not the reason to qualify: search_path is not a contract,
+-- qualification keeps grants and CDF targets unambiguous, and it matches the ticket_system /
+-- weather_system convention.
+--
+--   CREATE SCHEMA IF NOT EXISTS market_system;
+--
+--   market_system.users(user_id, display_name, created_at)
+--   market_system.watchlists(watchlist_id, user_id, name, created_at)
+--   market_system.watchlist_tickers(watchlist_id, ticker, added_at, added_by,
+--                                   PRIMARY KEY (watchlist_id, ticker))
+--   market_system.research_reports(report_id, user_id, ticker, question, report_md,
+--                                  forecast_id, created_at)
 --
 -- Lakebase is authoritative ONLY for application/transactional state. Analytical data stays
 -- in Delta, and there is no Delta -> Lakebase forecast-serving sync in this capstone.
 --
--- Enable Lakebase CDF on watchlist_tickers and research_reports so their changes flow into
--- Delta history tables — that is the CDC demo path. If the preview toggle is unavailable in
--- this workspace, fall back to the bootcamp's taught CDC method (architecture doc section 20,
--- condition 1).
+-- Enable Lakebase CDF on market_system.watchlist_tickers and market_system.research_reports so
+-- their changes flow into Delta history tables — that is the CDC demo path. If the preview
+-- toggle is unavailable in this workspace, fall back to the bootcamp's taught CDC method
+-- (architecture doc section 20, condition 1).
+--
+-- SERVICE PRINCIPAL GRANTS — do this before the first app deploy, not while debugging it.
+-- A new Databricks App gets a new service principal, and that identity has no Postgres role
+-- yet. Create its role through the regime-market-database project's OAuth tab, then grant it USAGE on
+-- schema market_system and the needed privileges on these four tables. Missing grants surface
+-- at first deploy as an authentication or permission failure that looks like an application
+-- bug and is not.
+--
+-- Connections are made with psycopg v3 through the pooled, per-connection-OAuth pattern in
+-- db.py (see src/database/lakebase.py). No static password exists anywhere.
 --
 -- TODO: implement.

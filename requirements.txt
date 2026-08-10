@@ -25,9 +25,17 @@ numpy==2.5.2
 # Trading-calendar arithmetic (XNYS sessions; never weekday arithmetic)
 exchange_calendars==4.13.2
 
-# Data access: Delta over a serverless SQL warehouse, Lakebase over Postgres
+# Data access: Delta over a serverless SQL warehouse, Lakebase over Postgres.
 databricks-sql-connector==4.4.0
-psycopg2-binary==2.9.12
+
+# psycopg v3, binary build, with the pool extra. The pool extra is required rather than
+# optional: the proven Lakebase pattern authenticates each pooled connection with its own
+# short-lived OAuth token via psycopg_pool.ConnectionPool.
+psycopg[binary,pool]==3.3.4
+
+# Workspace SDK. w.postgres.generate_database_credential mints the per-connection Postgres
+# OAuth credential; 0.125.0 is the floor for that call.
+databricks-sdk>=0.125.0
 
 # Application
 streamlit==1.61.1
@@ -38,3 +46,8 @@ PyYAML==6.0.3
 
 # Tests
 pytest==9.1.1
+
+# Local .env loading. Deliberately absent from requirements-databricks.txt and
+# app/requirements.txt: jobs read secret scopes and the deployed app reads app resources, so
+# nothing outside local development should ever load a .env file.
+python-dotenv==1.2.2

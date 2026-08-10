@@ -117,21 +117,26 @@ regime-market-agent/
 ├── requirements.txt              # local 3.12 venv, fully pinned (dev + pytest)
 └── requirements-databricks.txt   # ONLY packages the Databricks runtime lacks:
                                   # statsmodels, exchange_calendars,
-                                  # databricks-sql-connector, psycopg2-binary
+                                  # databricks-sql-connector, psycopg[binary,pool]
+                                  # (+ databricks-sdk as a version floor, not an absence)
 
 Dependency environments are split three ways, recorded here under rule 2 (spec silent →
 simplest working option). requirements.txt fully pins the local Python 3.12 dev/test venv —
-statsmodels, pandas, numpy, exchange_calendars, databricks-sql-connector, psycopg2-binary,
-streamlit, requests, pyyaml, pytest — with statsmodels==0.14.6 as a hard floor, since earlier
-versions fail to import under pandas 3.0; it is never installed on a cluster.
-requirements-databricks.txt is what notebooks and job environments install, and lists only the
-four packages the runtime lacks (statsmodels, exchange_calendars, databricks-sql-connector,
-psycopg2-binary): NEVER pip-upgrade pandas, numpy or pyarrow on a cluster, because the runtime
-pins those three against its own Spark build and replacing them breaks Spark in ways that
-surface far from the change. app/requirements.txt carries what the Databricks App consumes
-(streamlit, databricks-sql-connector, psycopg2-binary, pyyaml, requests); the app has no
-SparkSession and fits no models, so it needs no statsmodels. The frozen architecture doc is
-silent on dependency files and is unaffected by this split.
+statsmodels, pandas, numpy, exchange_calendars, databricks-sql-connector,
+psycopg[binary,pool], databricks-sdk, streamlit, requests, pyyaml, pytest — with
+statsmodels==0.14.6 as a hard floor, since earlier versions fail to import under pandas 3.0;
+it is never installed on a cluster. requirements-databricks.txt is what notebooks and job
+environments install, and lists only what the runtime lacks (statsmodels,
+exchange_calendars, databricks-sql-connector, psycopg[binary,pool]) plus databricks-sdk,
+which the runtime does ship but often below the >=0.125.0 floor that
+w.postgres.generate_database_credential requires: NEVER pip-upgrade pandas, numpy or pyarrow
+on a cluster, because the runtime pins those three against its own Spark build and replacing
+them breaks Spark in ways that surface far from the change. app/requirements.txt carries what
+the Databricks App consumes (streamlit, databricks-sql-connector, psycopg[binary,pool],
+databricks-sdk, pyyaml, requests); the app has no SparkSession and fits no models, so it needs
+no statsmodels. Lakebase uses psycopg v3 rather than psycopg2 because the proven connection
+pattern (C-2) depends on psycopg_pool.ConnectionPool with per-connection OAuth credentials.
+The frozen architecture doc is silent on dependency files and is unaffected by this split.
 
 config.yaml keys: massive.base_url, massive.rate_limit_per_min, tickers.seed[5],
 forecast.horizon_days=5, forecast.n_paths=5000, forecast.seed=42,
@@ -164,9 +169,17 @@ massive_api_key.
         def get_news(ticker, published_after) -> list[dict]
 
 Requirements: token-bucket or simple sleep-based throttle from
-cfg.rate_limit_per_min; follow pagination cursors/next_url to exhaustion; retry on
-429/5xx with exponential backoff + jitter (max 5 attempts); raise on 401/403 with a
+cfg.rate_limit_per_min; follow pagination to exhaustion via next_url from the response
+envelope (VERIFIED live — the envelope is {count, next_url, request_id, results, status});
+retry on 429/5xx with exponential backoff + jitter (max 5 attempts); raise on 401/403 with a
 clear message; log every request (url minus key, status, latency).
+
+SECURITY — apiKey travels as a QUERY PARAMETER, so URLs and error bodies are credential-
+bearing. On a non-200, NEVER log or print the response body or the full URL. Log only: the
+status code, the request_id if it parses out of the payload, and the endpoint name (e.g.
+"reference/news"). This is why a 401 body must not be echoed: Massive's error payloads and
+redirected URLs can reflect request params straight into your logs, notebook output, or an
+agent transcript. Same rule in the A-0 smoke test.
 
 ### A-2 Bronze
 bronze.prices_raw, bronze.news_raw: store the近-raw payload rows plus
@@ -175,16 +188,45 @@ run_id, task, started_at, finished_at, status, rows_written, error. MERGE keys:
 prices (ticker, source_timestamp); news (article_id, ticker) after a light explode.
 
 ### A-3 Silver
+(News shapes below are VERIFIED against a live Massive response, not inferred.)
+
 silver.daily_prices — ticker, trade_date, open, high, low, close, volume, vwap.
-MERGE on (ticker, trade_date). Convert Massive's epoch-ms timestamps to the trading
-date in exchange timezone (America/New_York), not UTC-naive.
+MERGE on (ticker, trade_date).
+
+Timestamp parsing is PER-SOURCE. Aggregates: t is epoch-milliseconds. News:
+published_utc is an ISO-8601 UTC string (e.g. "2026-08-10T02:15:00Z"). Both then map to
+the trading session in exchange timezone (America/New_York), never UTC-naive. Only the
+parsing step differs; the session rule does not.
 
 silver.news_articles — article_id, ticker, published_at, title, description,
-publisher, sentiment_label, sentiment_score, embedding_text (= title + "\n" +
-description), article_url. Composite key (article_id, ticker): explode the tickers
-array — one row per (article, ticker). MERGE on the composite key.
-Enable CDF at creation:
+publisher, sentiment_label, sentiment_score, sentiment_reasoning,
+embedding_text (= title + "\n" + description), article_url.
+MERGE on the composite key (article_id, ticker). CDF at creation:
   TBLPROPERTIES (delta.enableChangeDataFeed = true)
+
+EXPLODE FROM insights, NOT tickers. Each article carries both a tickers array and an
+insights array of {ticker, sentiment, sentiment_reasoning}. Sentiment exists only inside
+insights, so the explode is one row per (article, insight), taking BOTH ticker and
+sentiment from the insight. Deliberate consequence, accepted: a ticker listed in
+tickers with no corresponding insight produces NO row. Exploding tickers instead would
+manufacture rows with null sentiment. Observed live: insights tickers are a subset of
+tickers (10/10 articles, zero mismatches), so treat strict-subset as normal, not an anomaly.
+
+Field mapping from the Massive payload:
+  article_id          ← id                  (stable 64-char hex digest)
+  published_at        ← published_utc       (ISO-8601 UTC, parse then map to session)
+  publisher           ← publisher.name      (publisher is a nested dict:
+                                             name/homepage_url/logo_url/favicon_url)
+  ticker              ← insights[].ticker
+  sentiment_label     ← insights[].sentiment           (raw: positive/neutral/negative)
+  sentiment_reasoning ← insights[].sentiment_reasoning (raw text, kept for agent/UI display)
+  title, description, article_url pass through unchanged.
+
+sentiment_score is DERIVED at silver build time, not ingested. Massive returns NO numeric
+score — insight keys are exactly {ticker, sentiment, sentiment_reasoning}. Map
+positive→+1, neutral→0, negative→−1; any unrecognized label→0 AND log a warning, so a new
+vendor label degrades to neutral instead of failing or being silently dropped.
+daily_features s_t consumes sentiment_score unchanged (A-4).
 
 ### A-4 feature_pipeline.py → silver.daily_features
 Grain: (ticker, trade_date), trading days only (exchange_calendars, calendar XNYS).
@@ -197,8 +239,8 @@ Columns and definitions:
   volume_zscore_20d = (volume − mean_20) / stddev_20
   news assignment   : map published_at → its trading session; if market closed,
                       NEXT session from the calendar (never weekday arithmetic)
-  s_t               = mean of per-article normalized sentiment that session
-                      (positive→+1, neutral→0, negative→−1); 0 if no articles
+  s_t               = mean of silver.news_articles.sentiment_score for that session
+                      (already ±1/0 — derived at silver build, see A-3); 0 if no articles
   news_sentiment_3d = (1.0·s_t + 0.5·s_{t−1} + 0.25·s_{t−2}) / 1.75
   news_count        = article count mapped to that session
 Spark window functions partitioned by ticker ordered by trade_date. Rows with null
@@ -209,6 +251,17 @@ test_features: known synthetic price series → exact expected log_return, vol, 
 test_weekend_news: Saturday+Sunday articles land in Monday's s_t and news_count.
 test_idempotency: run silver build twice on same Bronze → identical row counts and
 checksums.
+
+FIXTURES must mirror the REAL payload shapes for both endpoints — no invented schemas.
+Fixtures are the only place the vendor contract is pinned in code, so a fixture that
+disagrees with production is worse than no fixture: it makes wrong code pass.
+Required for news: nested publisher dict (assert the mapping takes publisher.name), id as a
+64-hex digest, published_utc as an ISO-8601 UTC string, and insights entries carrying exactly
+{ticker, sentiment, sentiment_reasoning} with NO numeric score. Include at least one article
+where insights is a STRICT subset of tickers, and assert the extra ticker yields no row —
+that is the A-3 explode rule, and it is the one that silently regresses if someone
+"simplifies" the explode back to the tickers array. Include one article with an unrecognized
+sentiment label and assert sentiment_score → 0 plus a logged warning.
 
 ## CHECKPOINT B — Math works
 (The largest and most failure-prone checkpoint. Everything here runs in pandas after
@@ -316,17 +369,52 @@ embedding_text (managed embeddings), sync mode TRIGGERED. sync_news_index task i
 workflow triggers it. Query path: hybrid search, filter by ticker, top_k≈5.
 
 ### C-2 Lakebase
-setup/create_lakebase.sql: users(user_id, display_name, created_at);
-watchlists(watchlist_id, user_id, name, created_at);
-watchlist_tickers(watchlist_id, ticker, added_at, added_by, PRIMARY KEY
-(watchlist_id, ticker)); research_reports(report_id, user_id, ticker, question,
-report_md, forecast_id, created_at).
-database/lakebase.py: connection via psycopg2 using workspace-provided credentials
-(env vars in app.yaml); small functions: add_ticker, remove_ticker, save_report,
-get_watchlist. Parameterized SQL only.
-Enable Lakebase CDF on watchlist_tickers and research_reports → Delta history
-tables (per current docs; if the preview toggle is unavailable in this workspace,
-fall back to the bootcamp's taught CDC method — architecture doc §20 condition 1).
+INSTANCE. The capstone gets its OWN Lakebase project: regime-market-database, Autoscaling
+capacity, Postgres branch production (endpoint primary). It does NOT share the instance that
+hosts ticket_system and weather_system.
+
+SCHEMA. Its tables nonetheless live in their own schema, market_system, and every query fully
+qualifies it — market_system.watchlist_tickers, never bare watchlist_tickers. A dedicated
+project removes the collision risk but not the reason to qualify: search_path is not a
+contract, qualification keeps grants and CDF targets unambiguous, and it keeps the convention
+identical to ticket_system and weather_system so all three projects read the same way.
+
+setup/create_lakebase.sql: creates schema market_system, then
+market_system.users(user_id, display_name, created_at);
+market_system.watchlists(watchlist_id, user_id, name, created_at);
+market_system.watchlist_tickers(watchlist_id, ticker, added_at, added_by, PRIMARY KEY
+(watchlist_id, ticker)); market_system.research_reports(report_id, user_id, ticker,
+question, report_md, forecast_id, created_at).
+
+CONNECTION — the proven pattern, do not reinvent it. db.py is copied in from a prior
+project and is known to work against this Lakebase instance. src/database/lakebase.py
+WRAPS db.py; it does not replace, rewrite, or "improve" it. Adapt around its interface.
+The pattern it implements:
+  - psycopg v3 (psycopg[binary,pool]), NOT psycopg2.
+  - psycopg_pool.ConnectionPool holds the connections.
+  - Per-connection OAuth: each connection authenticates with a short-lived credential from
+    w.postgres.generate_database_credential (databricks-sdk >= 0.125.0). There is no static
+    password anywhere, which is what keeps rule 5 true.
+  - max_lifetime=3000 — connections are recycled before the OAuth credential expires.
+    A pool that outlives its token fails intermittently under load, which is the worst way
+    to discover this.
+  - check=ConnectionPool.check_connection — dead connections are detected on checkout
+    rather than surfacing as a query error in the app.
+
+src/database/lakebase.py exposes small functions over that pool: add_ticker, remove_ticker,
+save_report, get_watchlist. Parameterized SQL only, fully qualified table names only.
+
+SERVICE PRINCIPAL — known gotcha, handle before first deploy. A new Databricks App gets a
+new service principal, and that identity does not exist in Postgres yet. Before the app can
+read or write anything it needs (a) a Postgres role created for it via the
+regime-market-database project's OAuth tab, and (b) explicit grants on schema market_system
+and its tables. Skipping this
+produces an authentication or permission error at first deploy that looks like broken
+application code and is not. Do this as part of deployment, not as debugging.
+
+Enable Lakebase CDF on market_system.watchlist_tickers and market_system.research_reports →
+Delta history tables (per current docs; if the preview toggle is unavailable in this
+workspace, fall back to the bootcamp's taught CDC method — architecture doc §20 condition 1).
 
 ### C-3 llm/call_model.py + telemetry.py
 
@@ -352,8 +440,8 @@ search results and mention article titles; NEVER invent numbers; NEVER give buy/
 advice; confirm writes it performs.
 
 ### C-5 Streamlit app
-Reads Delta via databricks-sql-connector (serverless SQL warehouse), Lakebase via
-psycopg2. Page data sources:
+Reads Delta via databricks-sql-connector (serverless SQL warehouse), Lakebase via the
+psycopg v3 pool from C-2 (db.py wrapped by src/database/lakebase.py). Page data sources:
   market_research  → daily_prices (chart), regime_states, forecast_runs, news_articles
   research_agent   → agent loop; watchlist sidebar from Lakebase
   model_evaluation → backtest pooled summary; ALWAYS renders n and fallback rate;
@@ -390,6 +478,11 @@ Model C).
    cluster.
 4. Iterate: logic bugs → fix locally, push, pull, re-run notebook. Spark-specific
    issues → debug in the notebook, then port the fix back into src/.
+5. Local secrets: copy .env.example to .env and fill in real values. .env is git-ignored and
+   local-only — Databricks jobs read their secrets from secret scopes (A-0) and the deployed
+   app gets configuration from app resources / app.yaml, so neither reads .env. python-dotenv
+   is in requirements.txt for this and is deliberately absent from requirements-databricks.txt
+   and app/requirements.txt.
 
 ## C-b Where Spark actually runs
 Only ingestion/pipelines use Spark. Modeling code must not import pyspark. The
