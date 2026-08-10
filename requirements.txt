@@ -1,0 +1,40 @@
+# LOCAL DEVELOPMENT ENVIRONMENT ONLY — Python 3.12 venv (spec B0).
+#
+# Fully pinned so local runs are reproducible: pytest against the pure-pandas modeling layer,
+# plus editor and type support. Versions are the current releases as of 2026-08-09.
+#
+# statsmodels must stay at 0.14.6 or later: earlier versions fail to import under pandas 3.
+#
+# DO NOT install this file on a Databricks cluster. It pins pandas and numpy exactly, and
+# NEVER pip-upgrade pandas, numpy or pyarrow on a cluster — the runtime pins those three
+# against its own Spark build, and replacing them breaks Spark in ways that surface far from
+# the change. For notebooks and job environments use requirements-databricks.txt, which lists
+# only the four packages the runtime actually lacks.
+#
+# The Streamlit app does not read this file either; it reads app/requirements.txt.
+#
+#   local venv    -> requirements.txt              (this file)
+#   cluster       -> requirements-databricks.txt
+#   Databricks App-> app/requirements.txt
+
+# Modeling (pandas/statsmodels layer — Checkpoint B)
+statsmodels==0.14.6
+pandas==3.0.5
+numpy==2.5.2
+
+# Trading-calendar arithmetic (XNYS sessions; never weekday arithmetic)
+exchange_calendars==4.13.2
+
+# Data access: Delta over a serverless SQL warehouse, Lakebase over Postgres
+databricks-sql-connector==4.4.0
+psycopg2-binary==2.9.12
+
+# Application
+streamlit==1.61.1
+
+# Massive REST client and config loading
+requests==2.34.2
+PyYAML==6.0.3
+
+# Tests
+pytest==9.1.1

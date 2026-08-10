@@ -1,0 +1,12 @@
+-- Unity Catalog bootstrap (spec section 15 — the environment must be recreatable from code).
+--
+-- Creates the market_intel catalog and its bronze / silver / gold schemas.
+--
+-- Layer responsibilities:
+--   bronze  raw Massive payloads plus ingestion audit
+--   silver  cleaned prices, normalized news, engineered daily features
+--   gold    regime fits, forecasts, backtest metrics, model-call telemetry
+--
+-- The catalog name matches the `catalog` key in config/config.yaml (market_intel).
+--
+-- TODO: implement.

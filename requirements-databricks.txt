@@ -1,0 +1,33 @@
+# DATABRICKS CLUSTER INSTALLS — these are the only installs permitted on a cluster.
+#
+# NEVER pip-upgrade pandas, numpy or pyarrow on a Databricks cluster. The runtime pins those
+# three against its own Spark build; replacing them breaks Spark in ways that surface far away
+# from the change and are painful to diagnose. That is why this file exists as a separate,
+# deliberately short list instead of reusing requirements.txt (which pins pandas and numpy
+# exactly for the local venv).
+#
+# Everything else this project needs — pandas, numpy, pyarrow, requests, PyYAML — is already
+# preinstalled on the runtime. Only these four are absent.
+#
+# Usage, either one:
+#   %pip install -r requirements-databricks.txt        (notebook, at the top)
+#   declare the same list in the job environment       (so workflow tasks get them)
+#
+# After installing, sanity-check that pip did not touch the pinned three as a transitive
+# side effect: databricks-sql-connector declares pandas and pyarrow bounds, and the runtime's
+# versions normally satisfy them. If pip reports uninstalling pandas, numpy or pyarrow, stop
+# and resolve it rather than accepting the new environment.
+
+# Markov-switching MLE. 0.14.6 is a hard floor, not a preference: earlier versions fail to
+# import under pandas 3.
+statsmodels==0.14.6
+
+# XNYS trading sessions. Required because news-to-session mapping must use a real market
+# calendar, never weekday arithmetic.
+exchange_calendars==4.13.2
+
+# Delta access over a serverless SQL warehouse, for code paths shared with the app.
+databricks-sql-connector==4.4.0
+
+# Lakebase (Postgres) access.
+psycopg2-binary==2.9.12

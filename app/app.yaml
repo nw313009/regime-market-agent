@@ -1,0 +1,33 @@
+# Databricks App manifest (spec C-5).
+#
+# Declares how the Streamlit app starts and what environment it gets: SQL warehouse id,
+# catalog, and the Lakebase connection. The app's Python packages come from the repository
+# requirements.txt automatically.
+#
+# No secrets in this file. Values are either workspace resource ids or references the
+# workspace resolves at runtime.
+#
+# TODO: replace every placeholder below with the real workspace values, and confirm the
+# app's service principal has USE CATALOG / SELECT on market_intel and CAN USE on the
+# warehouse. "App can't read Delta" is nearly always a permissions problem here.
+
+command: ["streamlit", "run", "app/app.py"]
+
+env:
+  # Serverless SQL warehouse the app queries Delta through.
+  - name: DATABRICKS_WAREHOUSE_ID
+    value: "REPLACE_ME_warehouse_id"
+
+  # Unity Catalog catalog holding bronze / silver / gold.
+  - name: CATALOG
+    value: "market_intel"
+
+  # Lakebase (Postgres) connection, read by src/database/lakebase.py via psycopg2.
+  - name: LAKEBASE_HOST
+    value: "REPLACE_ME_lakebase_host"
+  - name: LAKEBASE_PORT
+    value: "5432"
+  - name: LAKEBASE_DATABASE
+    value: "REPLACE_ME_lakebase_database"
+  - name: LAKEBASE_USER
+    value: "REPLACE_ME_lakebase_user"

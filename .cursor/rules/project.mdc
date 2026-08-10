@@ -1,0 +1,32 @@
+---
+description: Frozen v2.1 architecture and build-spec constraints for the Regime-Aware Market Intelligence Agent capstone
+alwaysApply: true
+---
+
+# Regime-Aware Market Intelligence Agent
+
+The architecture is FROZEN as v2.1 — see `docs/architecture-v2.1-frozen.md`. The implementation
+contract is `docs/phase2_build_spec.md` and it is authoritative for schemas, function signatures,
+and tests.
+
+## HARD RULES
+
+1. Never introduce anything on the kill list in architecture doc §17: no model router, model tiers,
+   AI Gateway, Model D, LLM-generated forecasting features, Delta→Lakebase serving sync, multi-agent
+   systems, custom MCP servers, streaming, Kubernetes, microservices. Do not suggest them.
+2. Statistical constraints in architecture doc §5 are mandatory: statsmodels transition matrices are
+   LEFT-stochastic (columns = previous state, columns sum to 1); `exog_tvtp` must use news shifted by
+   one trading day with an explicit ones column; only `filtered_marginal_probabilities` may be used in
+   `src/models/` — never smoothed; regimes re-sorted by fitted variance after every fit; fallback
+   ladder C→B→A on fit failure.
+3. Spark only in `src/ingestion/` and `src/pipelines/`. `src/models/` is pure pandas/numpy/statsmodels
+   — never import pyspark there. Estimation uses percent log returns (×100), rescaled before simulation.
+4. Every pipeline write is a MERGE on the declared keys (prices: `ticker` + `trade_date`; news:
+   `article_id` + `ticker`). Never blind INSERT.
+5. No secrets in code, ever. Keys come from `dbutils.secrets` or env vars.
+6. Write the tests specified in the build spec IN THE SAME task as the code they test. Code without
+   its tests is incomplete.
+7. Follow the repo layout in build spec B0 exactly. Notebooks are thin wrappers; all logic lives in
+   `src/`.
+8. When the spec is silent, choose the simplest working option and leave a TODO comment. Ask before
+   adding any dependency not in `requirements.txt`.

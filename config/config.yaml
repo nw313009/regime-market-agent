@@ -1,0 +1,53 @@
+# Regime-Aware Market Intelligence Agent — configuration.
+#
+# Contains exactly the keys listed in docs/phase2_build_spec.md B0.
+#
+# No secrets here (spec rule 5). The Massive API key comes from the Databricks secret scope
+# created in A-0 (scope "capstone", key "massive_api_key") and is injected into MassiveClient
+# through its secret_getter argument.
+
+catalog: market_intel
+
+massive:
+  # TODO: confirm the base URL and the aggregates/news route paths against Massive's current
+  # docs — the A-0 smoke test is what proves them. Do not trust recalled endpoints.
+  base_url: https://api.massive.example.com
+  # Configurable rather than hard-coded because the real ceiling depends on the active plan.
+  # If backfill starts returning 429s, this value is wrong or the throttle is not sleeping.
+  rate_limit_per_min: 100
+
+tickers:
+  # The 5 seed tickers. The ingestion universe is these plus every watchlist ticker.
+  # AMD is deliberately absent: adding it live through the agent is the CDC demo moment.
+  seed:
+    - NVDA
+    - MSFT
+    - TSLA
+    - AMZN
+    - GOOGL
+
+forecast:
+  horizon_days: 5
+  n_paths: 5000
+  # One np.random.default_rng(seed) per forecast run; the seed is stored with the output.
+  seed: 42
+
+news:
+  # Half-life in trading days of the news signal during simulation:
+  #   news_h = current_news * exp(-ln(2) / half_life_days * h)
+  # This is an assumption, not a measurement, and the UI discloses it.
+  half_life_days: 2
+
+backtest:
+  # Refuse to fit with fewer observations than this.
+  min_train_days: 252
+  origin_freq: weekly
+  n_weeks: 26
+
+model:
+  # TODO: replace with a Foundation Model serving endpoint that exists in this workspace, and
+  # verify it responds to one call before Checkpoint C.
+  agent_endpoint: databricks-model-serving-agent-endpoint
+  # Unused until the optional SLM stretch goal (architecture doc section 16). Never feeds
+  # Model C.
+  slm_endpoint: databricks-model-serving-slm-endpoint

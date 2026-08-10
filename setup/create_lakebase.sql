@@ -1,0 +1,18 @@
+-- Lakebase (Postgres) schema for application state (spec C-2). Keep in sync with sql/.
+--
+--   users(user_id, display_name, created_at)
+--   watchlists(watchlist_id, user_id, name, created_at)
+--   watchlist_tickers(watchlist_id, ticker, added_at, added_by,
+--                     PRIMARY KEY (watchlist_id, ticker))
+--   research_reports(report_id, user_id, ticker, question, report_md, forecast_id,
+--                    created_at)
+--
+-- Lakebase is authoritative ONLY for application/transactional state. Analytical data stays
+-- in Delta, and there is no Delta -> Lakebase forecast-serving sync in this capstone.
+--
+-- Enable Lakebase CDF on watchlist_tickers and research_reports so their changes flow into
+-- Delta history tables — that is the CDC demo path. If the preview toggle is unavailable in
+-- this workspace, fall back to the bootcamp's taught CDC method (architecture doc section 20,
+-- condition 1).
+--
+-- TODO: implement.

@@ -1,0 +1,33 @@
+-- Delta table DDL (spec A-2, A-3, A-4, B-6). Keep in sync with sql/.
+--
+-- bronze.prices_raw       near-raw payload + source, ingested_at, request_id, ticker,
+--                         source_timestamp.            MERGE (ticker, source_timestamp)
+-- bronze.news_raw         near-raw payload + the same audit columns.
+--                                                      MERGE (article_id, ticker)
+-- bronze.ingestion_runs   run_id, task, started_at, finished_at, status, rows_written, error
+--
+-- silver.daily_prices     ticker, trade_date, open, high, low, close, volume, vwap.
+--                                                      MERGE (ticker, trade_date)
+-- silver.news_articles    article_id, ticker, published_at, title, description, publisher,
+--                         sentiment_label, sentiment_score, embedding_text, article_url.
+--                                                      MERGE (article_id, ticker)
+--   MUST be created with Change Data Feed enabled, because the AI Search Delta Sync index
+--   reads the CDF. Missing this at creation time is why an index comes back empty:
+--     TBLPROPERTIES (delta.enableChangeDataFeed = true)
+-- silver.daily_features   grain (ticker, trade_date); log_return, return_5d, momentum_5d,
+--                         realized_vol_20d, volume_zscore_20d, news_sentiment_3d,
+--                         news_count. Warm-up nulls stay in the table.
+--
+-- gold.regime_states      ticker, as_of_date, prob_low_vol, prob_high_vol, low/high mean and
+--                         sigma, current_news_signal, model_used, model_version
+-- gold.forecast_runs      forecast_id, ticker, generated_at, as_of_date, horizon_days,
+--                         model_used, current_price, price_p10/50/90, return_p10/50/90,
+--                         prob_positive, prob_loss_gt_5pct, prob_low_vol, prob_high_vol,
+--                         n_paths, seed, model_version
+-- gold.backtest_metrics   origin_date, ticker, model, brier, mae, covered_80 (bool),
+--                         model_used, converged; plus a pooled_summary view/table carrying n
+-- gold.model_calls        ts, task, model, latency_ms, ok, in_tokens, out_tokens
+--
+-- These tables are tiny (~2.5k rows per ticker). Do not partition them.
+--
+-- TODO: implement.

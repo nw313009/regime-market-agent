@@ -1,0 +1,86 @@
+# ---------- Python ----------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Distribution / packaging
+.Python
+build/
+dist/
+sdist/
+wheels/
+*.egg-info/
+*.egg
+.eggs/
+MANIFEST
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+.python-version
+
+# Test / coverage / type-check caches
+.pytest_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.tox/
+.nox/
+.hypothesis/
+.mypy_cache/
+.pyre/
+.pytype/
+.ruff_cache/
+
+# Jupyter
+.ipynb_checkpoints/
+profile_default/
+ipython_config.py
+
+# ---------- Databricks ----------
+# Databricks CLI / bundle state and locally synced artifacts
+.databricks/
+.databrickscfg
+databricks.env
+
+# Local Spark / Delta scratch output. Nothing analytical belongs in git; Delta tables live in
+# Unity Catalog, not in the repo.
+spark-warehouse/
+metastore_db/
+derby.log
+*.crc
+_delta_log/
+checkpoint/
+dbfs/
+
+# Streamlit local secrets — Databricks Apps supply env via app/app.yaml instead
+.streamlit/secrets.toml
+
+# ---------- Secrets (spec rule 5: no secrets in code) ----------
+# The Massive API key comes from the Databricks secret scope "capstone", never from a file.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials.json
+secrets.yaml
+secrets.yml
+
+# ---------- Editors / OS ----------
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---------- Local scratch ----------
+# Backtest output and figures are regenerated from code; Gold tables are the record.
+*.log
+scratch/
+tmp/
+outputs/
