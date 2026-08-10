@@ -9,7 +9,8 @@
 -- silver.daily_prices     ticker, trade_date, open, high, low, close, volume, vwap.
 --                                                      MERGE (ticker, trade_date)
 -- silver.news_articles    article_id, ticker, published_at, title, description, publisher,
---                         sentiment_label, sentiment_score, embedding_text, article_url.
+--                         sentiment_label, sentiment_score, sentiment_reasoning,
+--                         embedding_text, article_url.
 --                                                      MERGE (article_id, ticker)
 --   MUST be created with Change Data Feed enabled, because the AI Search Delta Sync index
 --   reads the CDF. Missing this at creation time is why an index comes back empty:
@@ -109,9 +110,53 @@ USING DELTA
 COMMENT 'Ingestion audit ledger (A-2). MERGE on (run_id).';
 
 -- =====================================================================================
--- SILVER (A-3, A-4) — TODO: implement at checkpoint A-3.
--- Remember TBLPROPERTIES (delta.enableChangeDataFeed = true) on silver.news_articles at
--- CREATE time; adding it later does not backfill the feed the AI Search index reads.
+-- SILVER (A-3) — implemented
+-- =====================================================================================
+-- Silver is where cleaning and derivation happen: the session-date mapping, the volume cast,
+-- the sentiment_score mapping and embedding_text. Both tables are rebuilt from bronze by a
+-- MERGE on their declared keys, so a re-run is idempotent.
+
+-- One row per (ticker, trading session). trade_date is the bronze bar instant resolved in
+-- America/New_York, never a UTC-naive date: a UTC truncation moves a winter bar stamped at
+-- 04:00Z onto the previous session.
+CREATE TABLE IF NOT EXISTS market_intel.silver.daily_prices (
+  ticker     STRING NOT NULL COMMENT 'MERGE key 1.',
+  trade_date DATE   NOT NULL COMMENT 'Exchange session date (America/New_York) of the bar. MERGE key 2.',
+  `open`     DOUBLE          COMMENT 'Session open.',
+  high       DOUBLE          COMMENT 'Session high.',
+  low        DOUBLE          COMMENT 'Session low.',
+  `close`    DOUBLE          COMMENT 'Session close. The modeling layer takes log returns of this column.',
+  volume     BIGINT          COMMENT 'Shares traded, rounded from the bronze DOUBLE: the vendor sends a fractional value in scientific notation, and share counts are whole.',
+  vwap       DOUBLE          COMMENT 'Volume-weighted average price.'
+)
+USING DELTA
+COMMENT 'Cleaned daily bars, grain (ticker, trade_date). MERGE on (ticker, trade_date) — never a blind INSERT.';
+
+-- One row per (article, insight), carried through from bronze. sentiment_score is DERIVED here.
+-- CHANGE DATA FEED IS MANDATORY AT CREATION TIME. The AI Search Delta Sync index (C-1) reads
+-- this table's CDF; enabling the property later does not backfill the feed, and the symptom is
+-- an index that syncs to zero rows.
+CREATE TABLE IF NOT EXISTS market_intel.silver.news_articles (
+  article_id          STRING NOT NULL COMMENT 'Bronze article_id, a stable 64-char hex digest. MERGE key 1.',
+  ticker              STRING NOT NULL COMMENT 'Per-insight ticker from bronze. MERGE key 2.',
+  published_at        TIMESTAMP       COMMENT 'published_utc parsed from its ISO-8601 UTC string. Mapping to a trading session happens in A-4, not here.',
+  title               STRING          COMMENT 'Passed through from bronze.',
+  description         STRING          COMMENT 'Passed through from bronze. May be NULL.',
+  publisher           STRING          COMMENT 'publisher.name, flattened in bronze as publisher_name.',
+  sentiment_label     STRING          COMMENT 'RAW vendor label, kept verbatim even when unrecognized.',
+  sentiment_score     INT             COMMENT 'DERIVED here: positive=+1, neutral=0, negative=-1, unrecognized=0 with a logged warning. daily_features.s_t consumes this unchanged.',
+  sentiment_reasoning STRING          COMMENT 'Raw vendor reasoning text, kept for agent and UI display.',
+  embedding_text      STRING          COMMENT 'title + newline + description, description omitted when absent. Embedding source column for the AI Search index.',
+  article_url         STRING          COMMENT 'Passed through from bronze.'
+)
+USING DELTA
+COMMENT 'Normalized news, one row per (article, insight). MERGE on (article_id, ticker) — never a blind INSERT.'
+TBLPROPERTIES (delta.enableChangeDataFeed = true);
+
+-- =====================================================================================
+-- SILVER FEATURES (A-4) — TODO: implement at checkpoint A-4.
+-- silver.daily_features, grain (ticker, trade_date), trading days only (XNYS). Rows with null
+-- rolling features stay in the table; the modeling layer drops them.
 -- =====================================================================================
 
 -- =====================================================================================

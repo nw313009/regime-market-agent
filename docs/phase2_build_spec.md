@@ -113,10 +113,11 @@ regime-market-agent/
 ├── sql/            (DDL kept in sync with setup/)
 ├── tests/          test_features.py | test_models.py | test_monte_carlo.py |
 │                   test_no_lookahead.py | test_agent_tools.py | test_idempotency.py |
-│                   test_massive_client.py | test_ingestion.py | conftest.py
-│                   # the last three added at A-1/A-2: the vendor client and the ingestion
-│                   # watermark/row-building logic had no home in the original list, and
-│                   # conftest.py holds the payload fixtures both use
+│                   test_massive_client.py | test_ingestion.py | test_silver.py |
+│                   conftest.py
+│                   # the last four added at A-1/A-2/A-3: the vendor client, the ingestion
+│                   # watermark/row-building logic and the silver derivations had no home in
+│                   # the original list, and conftest.py holds the payload fixtures they share
 ├── config/config.yaml
 ├── requirements.txt              # local 3.12 venv, fully pinned (dev + pytest)
 └── requirements-databricks.txt   # ONLY packages the Databricks runtime lacks:
