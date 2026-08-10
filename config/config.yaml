@@ -54,3 +54,15 @@ backtest:
 model:
   agent_endpoint: databricks-meta-llama-3-3-70b-instruct
   slm_endpoint: databricks-meta-llama-3-1-8b-instruct
+
+telemetry:
+  # Added at C-3; the B0 key list predates the telemetry destination question. Where
+  # src/llm/telemetry.py sends the one record it appends per model call:
+  #   delta  MERGE the buffered records into gold.model_calls. Needs an injected SparkSession,
+  #          so it is the value for notebooks and workflow tasks — and the spec's destination.
+  #   log    keep the records in memory and log them on flush, writing nothing.
+  #   off    record nothing at all.
+  # The file default is the spec's destination. The Databricks App has NO SparkSession (C-5), so
+  # app.yaml overrides this with TELEMETRY_MODE=log: one repository config is read by both the
+  # app and the jobs, and the app is the exception rather than the rule.
+  mode: delta

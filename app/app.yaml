@@ -38,7 +38,21 @@ env:
   - name: LAKEBASE_PORT
     value: "5432"
   - name: LAKEBASE_DATABASE
-    value: "REPLACE_ME_lakebase_database"
-  # Schema the capstone's tables live in. Every query fully qualifies it.
+    value: "databricks_postgres"
+  # The Postgres role the app connects as — the service principal created in the OAuth tab above.
+  - name: LAKEBASE_USER
+    value: "REPLACE_ME_app_service_principal"
+  # Endpoint resource name passed to w.postgres.generate_database_credential. Without it there is
+  # no way to mint the per-connection credential, so the app cannot connect at all.
+  - name: LAKEBASE_ENDPOINT
+    value: "projects/regime-market-database/branches/production/endpoints/primary"
+  # Informational only: src/database/lakebase.py fixes the schema as a constant, because a schema
+  # name is an identifier and an environment-driven identifier would have to be spliced into SQL.
   - name: LAKEBASE_SCHEMA
     value: "market_system"
+
+  # Model-call telemetry (C-3). "log" is mandatory here and is the one place the repository
+  # config is overridden: config.yaml sets telemetry.mode=delta for notebooks and jobs, and a
+  # Databricks App has NO SparkSession, so it cannot MERGE into gold.model_calls.
+  - name: TELEMETRY_MODE
+    value: "log"

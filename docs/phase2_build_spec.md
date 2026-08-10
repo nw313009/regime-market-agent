@@ -122,10 +122,15 @@ regime-market-agent/
 ├── tests/          test_features.py | test_models.py | test_monte_carlo.py |
 │                   test_no_lookahead.py | test_agent_tools.py | test_idempotency.py |
 │                   test_massive_client.py | test_ingestion.py | test_silver.py |
+│                   test_call_model.py | test_telemetry.py | test_lakebase.py |
 │                   conftest.py
-│                   # the last four added at A-1/A-2/A-3: the vendor client, the ingestion
-│                   # watermark/row-building logic and the silver derivations had no home in
-│                   # the original list, and conftest.py holds the payload fixtures they share
+│                   # test_massive_client/test_ingestion/test_silver/conftest added at A-1/A-2/A-3:
+│                   # the vendor client, the ingestion watermark/row-building logic and the silver
+│                   # derivations had no home in the original list, and conftest.py holds the
+│                   # payload fixtures they share. test_call_model/test_telemetry/test_lakebase
+│                   # added at C-2/C-3 for the same reason: C-7 names only test_agent_tools, which
+│                   # is the agent's integration test, and the model wrapper, the telemetry buffer
+│                   # and the Postgres access layer are all unit-testable without a workspace.
 ├── config/config.yaml
 ├── requirements.txt              # local 3.12 venv, fully pinned (dev + pytest)
 └── requirements-databricks.txt   # ONLY packages the Databricks runtime lacks:
@@ -156,7 +161,14 @@ massive.backfill_start_date="2024-08-01", tickers.seed[5],
 forecast.horizon_days=5, forecast.n_paths=5000, forecast.seed=42,
 news.half_life_days=2, backtest.min_train_days=252, backtest.origin_freq=weekly,
 backtest.n_weeks=26, model.agent_endpoint, model.slm_endpoint (unused until stretch),
-catalog=market_intel.
+catalog=market_intel, telemetry.mode (added at C-3).
+
+telemetry.mode was added at C-3 because the original key list predates the question of where
+model-call telemetry goes, and there is no single answer: the spec's destination is a Delta
+table, and the Databricks App that makes most of the calls has no SparkSession (C-5). Values are
+delta | log | off; the file says delta (notebooks and jobs) and app.yaml overrides it with the
+TELEMETRY_MODE environment variable. One config, one documented exception, rather than two
+configs that drift.
 
 massive.backfill_start_date was added at A-2 (the original key list had no backfill window, and
 the ingestion tasks need one for the empty-table case). It is a FIXED ISO date rather than a
@@ -491,6 +503,26 @@ Enable Lakebase CDF on market_system.watchlist_tickers and market_system.researc
 Delta history tables (per current docs; if the preview toggle is unavailable in this
 workspace, fall back to the bootcamp's taught CDC method — architecture doc §20 condition 1).
 
+Decisions taken where the above is silent (C-2 implementation):
+- REPLICA IDENTITY FULL on both CDF tables, in the DDL. Postgres logical decoding emits only the
+  primary key for an UPDATE or DELETE under the default replica identity, so a removed ticker
+  would arrive in the Delta history table with no ticker and no added_by — the CDC demo step
+  would show a row of nulls. It requires table ownership; that is a grant to fix, not a statement
+  to drop.
+- Ids are application-generated TEXT, not serials or gen_random_uuid() defaults, because
+  save_research_report has to return the id it wrote (C-4) and generating it in Python keeps that
+  a plain INSERT. The demo user and watchlist get readable, stable ids as a side effect.
+- ensure_tables() EXECUTES setup/create_lakebase.sql rather than holding a second copy of the
+  statements — the same single-source rule that emptied sql/ (B0).
+- Column types: TEXT and TIMESTAMPTZ throughout, real foreign keys inside Lakebase, and NO
+  foreign key on research_reports.forecast_id, which points at a Delta row in the other store.
+- The schema name is a constant in code, not an environment variable: it is an identifier, so it
+  cannot be a bound parameter, and an env-driven identifier spliced into SQL is exactly what
+  "parameterized SQL only" exists to prevent. app.yaml's LAKEBASE_SCHEMA is informational.
+- Every function takes an optional connection. Passing one skips the pool, which is how the unit
+  tests assert the SQL and its parameters without a database; the pool's context manager owns the
+  transaction otherwise.
+
 ### C-3 llm/call_model.py + telemetry.py
 
     def call_model(task: str, messages, tools=None, response_format=None) -> Response
@@ -499,6 +531,26 @@ Reads endpoint name from config by task ("agent" now; "slm" later). Wraps the
 Databricks Foundation Model API (OpenAI-compatible chat completions). telemetry.py
 appends {ts, task, model, latency_ms, ok, in_tokens, out_tokens} to a Delta table
 gold.model_calls. No routing logic. No tiers.
+
+Decisions taken where the above is silent (C-3 implementation):
+- Transport is a plain POST to {host}/serving-endpoints/{endpoint}/invocations with requests,
+  which is already a dependency. databricks-sdk's serving_endpoints.query takes typed ChatMessage
+  objects and would mean translating OpenAI-shaped messages/tools/response_format into SDK
+  dataclasses and back; the SDK is still what resolves the CREDENTIAL, so notebooks, jobs and the
+  app all authenticate as the identity they already run as.
+- Retries: 429 and 5xx only, 3 attempts, exponential backoff with jitter — a scale-to-zero
+  endpoint answers 503 while it wakes. Fewer attempts than the ingestion client's five because a
+  model call sits on the interactive path.
+- Nothing credential-bearing and no request or response body reaches a log record: prompts and
+  completions carry user text. The endpoint, status, latency and token counts do.
+- gold.model_calls carries a call_id (uuid4) beyond the spec's column list. Rule 4 requires a
+  MERGE on declared keys and the record has no natural identity, so without it a retried flush
+  would duplicate rows. Failed calls are rows too: ok=false with NULL tokens.
+- record() only buffers; flush() writes. A Spark write must not sit inside a chat turn, and a
+  failed flush re-queues its records — safe precisely because the write is a MERGE on call_id.
+- Three modes (telemetry.mode, above), because the Streamlit app cannot run Spark. The unset
+  default is log-only: a default that needs a SparkSession turns a forgotten setting into an
+  agent failure.
 
 ### C-4 agent/
 tools.py — four functions with JSON-schema declarations:

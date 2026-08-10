@@ -33,7 +33,8 @@
 -- gold.backtest_summary   the pooled summary carrying n: model, n, n_tickers, brier, mae,
 --                         coverage_80, fallback_rate, computed_at.
 --                                                      MERGE (model)
--- gold.model_calls        ts, task, model, latency_ms, ok, in_tokens, out_tokens
+-- gold.model_calls        call_id, ts, task, model, latency_ms, ok, in_tokens, out_tokens
+--                                                      MERGE (call_id)
 --
 -- These tables are tiny (~2.5k rows per ticker). Do not partition them.
 --
@@ -315,7 +316,27 @@ USING DELTA
 COMMENT 'Pooled backtest summary, one row per model. MERGE on (model) — never a blind INSERT.';
 
 -- =====================================================================================
--- GOLD (C-3) — TODO: implement at checkpoint C-3.
+-- GOLD (C-3) — implemented
 -- =====================================================================================
--- gold.model_calls   ts, task, model, latency_ms, ok, in_tokens, out_tokens — LLM telemetry,
---                    appended by src/llm/telemetry.py. Lands with call_model at C-3.
+-- One row per model call, buffered in memory by src/llm/telemetry.py and MERGEd here on flush.
+-- Instrumentation only: no routing subsystem reads it, and nothing in the product depends on it.
+--
+-- call_id EXISTS SO THE WRITE CAN BE A MERGE. The spec's column list ({ts, task, model,
+-- latency_ms, ok, in_tokens, out_tokens}) has no identity, and rule 4 forbids a blind INSERT, so
+-- every record carries a uuid4 and that is the key. Without it a retried flush — the app's flush
+-- is best-effort and re-queues its records when a write fails — would duplicate rows.
+--
+-- FAILED CALLS ARE ROWS TOO: ok = false with NULL token counts. A telemetry table holding only
+-- successes cannot answer the question it exists for.
+CREATE TABLE IF NOT EXISTS market_intel.gold.model_calls (
+  call_id    STRING    NOT NULL COMMENT 'uuid4 minted when the record was buffered. MERGE key — the record has no natural identity, and a MERGE needs one.',
+  ts         TIMESTAMP          COMMENT 'UTC wall-clock when the call was recorded (call completion, success or failure).',
+  task       STRING             COMMENT 'The call_model task, i.e. which config endpoint was used: agent | slm. NOT a model tier — there is no router (architecture doc section 17).',
+  model      STRING             COMMENT 'Model the endpoint reported, falling back to the serving endpoint name when the response omits it.',
+  latency_ms DOUBLE             COMMENT 'Wall-clock milliseconds around the HTTP call, including any retry waits — what the user actually waited.',
+  ok         BOOLEAN            COMMENT 'Whether the call returned a usable completion. False rows carry the latency of the failure and NULL tokens.',
+  in_tokens  BIGINT             COMMENT 'usage.prompt_tokens when the endpoint reports it, else NULL. NULL means "not reported", never 0.',
+  out_tokens BIGINT             COMMENT 'usage.completion_tokens when the endpoint reports it, else NULL.'
+)
+USING DELTA
+COMMENT 'LLM call telemetry (C-3). MERGE on (call_id) — never a blind INSERT.';
