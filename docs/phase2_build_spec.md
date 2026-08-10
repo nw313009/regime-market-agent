@@ -112,7 +112,11 @@ regime-market-agent/
 │                   create_workflow.py | seed_demo_data.py
 ├── sql/            (DDL kept in sync with setup/)
 ├── tests/          test_features.py | test_models.py | test_monte_carlo.py |
-│                   test_no_lookahead.py | test_agent_tools.py | test_idempotency.py
+│                   test_no_lookahead.py | test_agent_tools.py | test_idempotency.py |
+│                   test_massive_client.py | test_ingestion.py | conftest.py
+│                   # the last three added at A-1/A-2: the vendor client and the ingestion
+│                   # watermark/row-building logic had no home in the original list, and
+│                   # conftest.py holds the payload fixtures both use
 ├── config/config.yaml
 ├── requirements.txt              # local 3.12 venv, fully pinned (dev + pytest)
 └── requirements-databricks.txt   # ONLY packages the Databricks runtime lacks:
@@ -138,28 +142,48 @@ no statsmodels. Lakebase uses psycopg v3 rather than psycopg2 because the proven
 pattern (C-2) depends on psycopg_pool.ConnectionPool with per-connection OAuth credentials.
 The frozen architecture doc is silent on dependency files and is unaffected by this split.
 
-config.yaml keys: massive.base_url, massive.rate_limit_per_min, tickers.seed[5],
+config.yaml keys: massive.base_url, massive.rate_limit_per_min,
+massive.backfill_start_date="2024-08-01", tickers.seed[5],
 forecast.horizon_days=5, forecast.n_paths=5000, forecast.seed=42,
 news.half_life_days=2, backtest.min_train_days=252, backtest.origin_freq=weekly,
 backtest.n_weeks=26, model.agent_endpoint, model.slm_endpoint (unused until stretch),
 catalog=market_intel.
 
+massive.backfill_start_date was added at A-2 (the original key list had no backfill window, and
+the ingestion tasks need one for the empty-table case). It is a FIXED ISO date rather than a
+rolling lookback because a rolling window fetches a different dataset on every run, which breaks
+reproducibility — setup/ plus this config should recreate the same Bronze — and silently shifts
+the backtest sample between runs. Empty table → fetch from this date; populated table → fetch
+from the per-ticker watermark.
+
 ## CHECKPOINT A — Data works
 
 ### A-0 Smoke test (FIRST ACTION, before anything else)
-Notebook cell, near-verbatim:
+Implemented as notebooks/00_smoke_test.py — the SINGLE smoke test. No local duplicate script
+(B0 lists one file; a near-duplicate drifts and then disagrees with itself).
 
-    import requests
-    key = dbutils.secrets.get(scope="capstone", key="massive_api_key")
-    r = requests.get(f"{BASE_URL}/v2/aggs/ticker/NVDA/range/1/day/2026-07-01/2026-08-01",
-                     params={"apiKey": key}, timeout=30)
-    print(r.status_code); print(r.json() if r.ok else r.text[:500])
+Dual auth, no secret ever in the file:
+  local          MASSIVE_API_KEY from the environment, falling back to repo-root .env
+  workspace cell getpass prompt (typed, not stored)
+  scheduled job  dbutils.secrets.get(scope="capstone", key="massive_api_key")
+Secret setup: databricks secrets create-scope capstone; databricks secrets put-secret
+capstone massive_api_key.
 
-(Adjust path to Massive's current aggregates route — check their docs, don't trust
-memory.) 200 + JSON → proceed. Anything else → stop and diagnose (401/403 = key/plan,
-connection error = workspace egress). Secret setup first:
-databricks secrets create-scope capstone; databricks secrets put-secret capstone
-massive_api_key.
+Both routes are VERIFIED live (200, same session) — treat both as confirmed and do NOT
+re-derive these paths from memory:
+  aggregates  /v2/aggs/ticker/NVDA/range/1/day/<from>/<to>  → 22-bar results payload
+  news        /v2/reference/news?ticker=NVDA&limit=N        → {count, next_url, request_id,
+                                                              results, status}
+
+OUTPUT RULE: print the status code, the request_id, and structural facts about the payload
+(key names, counts) ONLY. NEVER print a response body or a full URL. apiKey travels as a
+query parameter and error payloads can echo it into logs, notebook output, or an agent
+transcript — the r.text[:500] form this spec previously showed is banned for that reason
+(A-1 security requirement).
+
+200 → proceed to A-1. Anything else → stop and diagnose (401/403 = key or plan; connection
+error = egress). Note the specific case: "API Key was not provided" means the key never
+reached the request at all, so check env/.env loading before suspecting the key or the plan.
 
 ### A-1 massive_client.py contract
 
@@ -182,10 +206,20 @@ redirected URLs can reflect request params straight into your logs, notebook out
 agent transcript. Same rule in the A-0 smoke test.
 
 ### A-2 Bronze
-bronze.prices_raw, bronze.news_raw: store the近-raw payload rows plus
+bronze.prices_raw, bronze.news_raw: store the near-raw payload rows plus
 source, ingested_at, request_id, ticker, source_timestamp. bronze.ingestion_runs:
 run_id, task, started_at, finished_at, status, rows_written, error. MERGE keys:
 prices (ticker, source_timestamp); news (article_id, ticker) after a light explode.
+
+The news explode is FROM insights, not from the tickers array — same rule as A-3, applied one
+layer earlier so the bronze row already carries the per-insight ticker alongside its raw
+sentiment/sentiment_reasoning. Exploding tickers here would manufacture bronze rows with no
+sentiment and would put the A-3 rule one refactor away from regressing. Consequence, accepted:
+a ticker listed in tickers with no insight produces no bronze row.
+
+Bronze prices key on source_timestamp (the epoch-ms bar start, resolved in the exchange
+timezone) rather than trade_date, which is silver's grain — bronze stays near-raw and the
+session-date mapping happens once, in silver.
 
 ### A-3 Silver
 (News shapes below are VERIFIED against a live Massive response, not inferred.)

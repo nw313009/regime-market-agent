@@ -9,12 +9,19 @@
 catalog: market_intel
 
 massive:
-  # TODO: confirm the base URL and the aggregates/news route paths against Massive's current
-  # docs — the A-0 smoke test is what proves them. Do not trust recalled endpoints.
-  base_url: https://api.massive.example.com
+  # VERIFIED by the A-0 smoke test (two independent sessions): both routes return 200 here.
+  #   aggregates  /v2/aggs/ticker/{ticker}/range/1/day/{from}/{to}
+  #   news        /v2/reference/news
+  base_url: https://api.massive.com
   # Configurable rather than hard-coded because the real ceiling depends on the active plan.
   # If backfill starts returning 429s, this value is wrong or the throttle is not sleeping.
-  rate_limit_per_min: 100
+  rate_limit_per_min: 5
+  # Start of the backfill window used when a bronze table has no rows for a ticker yet.
+  # A fixed ISO date, deliberately, not a rolling "N days back": a rolling window makes every
+  # rebuild fetch a different dataset, which breaks the reproducibility story (setup/ scripts
+  # plus this config should recreate the same Bronze) and shifts the backtest sample between
+  # runs. Incremental runs advance from the per-ticker watermark regardless of this value.
+  backfill_start_date: "2024-08-01"
 
 tickers:
   # The 5 seed tickers. The ingestion universe is these plus every watchlist ticker.
