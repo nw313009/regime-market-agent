@@ -281,11 +281,43 @@ Columns and definitions:
 Spark window functions partitioned by ticker ordered by trade_date. Rows with null
 rolling features (warm-up period) stay in the table; the modeling layer drops them.
 
+Decisions taken where the above is silent (A-4 implementation):
+- close and volume are CARRIED into daily_features from daily_prices. B-4 reads the last close
+  as current_price and A-4 needs volume for the z-score, and C-b makes daily_features the only
+  table the modeling layer reads — so requiring a second table read there would break that line.
+- Every rolling column is NULL until its frame is FULL, enforced with a count over the same
+  frame. Spark aggregates skip NULLs, so a 20-row frame holding 19 usable returns would
+  otherwise report a 19-observation stddev as a 20-day one. First non-null: momentum_5d row 5,
+  realized_vol_20d row 20, volume_zscore_20d row 19 (one earlier — volume has no undefined
+  first row).
+- mean_20/stddev_20 for volume_zscore_20d use the trailing 20 rows INCLUDING the current row,
+  the same frame as realized_vol_20d, and stddev_20 is stddev_samp for consistency with it. A
+  constant window (zero deviation) yields NULL, not an infinity, via try_divide.
+- news_sentiment_3d treats a missing s_{t−1}/s_{t−2} at the start of history as 0, since the
+  denominator is fixed at 1.75 and "no articles" is already defined as 0. The column is never
+  NULL.
+- The date → session lookup is built on the driver from the XNYS calendar and broadcast to
+  Spark as a small temp view, so the calendar is consulted in exactly one place and the join is
+  a plain equality join. Its range is the price date range: an article rolling past the last bar
+  is picked up by the run that ingests that bar.
+- The bronze.ingestion_runs ledger (A-2) is extended to the pipeline tasks. build_silver_prices,
+  build_silver_news and build_features each write one row per call, same shape, on success and
+  on failure, through the shared write layer — so a workflow run leaves one audit row per task.
+
 ### A-5 Checkpoint A tests
 test_features: known synthetic price series → exact expected log_return, vol, z.
 test_weekend_news: Saturday+Sunday articles land in Monday's s_t and news_count.
 test_idempotency: run silver build twice on same Bronze → identical row counts and
 checksums.
+
+Implemented as: exact values on series with closed forms (constant log returns via a geometric
+close series, alternating ±r for a non-degenerate stddev, volumes [100]×19+[200] for a z-score
+of 95/√500), the warm-up boundaries above, and the calendar cases. test_weekend_news is
+accompanied by WEEKDAY-HOLIDAY cases — Good Friday 2026-04-03 and the observed Independence Day
+2026-07-03 are both Fridays, so weekday arithmetic assigns their articles to the same day while
+the calendar assigns them to the following Monday. A weekday-arithmetic implementation passes
+the weekend test and fails these, which is why both exist. test_idempotency needs Delta and
+stays on the workspace integration list.
 
 FIXTURES must mirror the REAL payload shapes for both endpoints — no invented schemas.
 Fixtures are the only place the vendor contract is pinned in code, so a fixture that

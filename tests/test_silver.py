@@ -39,9 +39,9 @@ from src.pipelines.silver_news import (
 )
 from src.pipelines.silver_news import MERGE_KEYS as NEWS_MERGE_KEYS
 from src.pipelines.silver_news import build_source_sql as build_news_source_sql
+from src.pipelines import EXCHANGE_TZ_NAME
 from src.pipelines.silver_prices import (
     DAILY_PRICE_COLUMNS,
-    EXCHANGE_TZ_NAME,
     TRADE_DATE_EXPR,
     VOLUME_EXPR,
     trade_date_from_epoch_ms,

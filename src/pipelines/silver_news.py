@@ -69,7 +69,18 @@ import logging
 from collections.abc import Iterable, Mapping
 from typing import Any
 
-from src.pipelines import latest_per_key_sql, merge_select, qualified, require_table
+from src.pipelines import (
+    STATUS_FAILED,
+    RunRecord,
+    latest_per_key_sql,
+    merge_select,
+    new_run_id,
+    qualified,
+    record_run,
+    require_table,
+    truncate_error,
+    utc_now,
+)
 
 log = logging.getLogger(__name__)
 
@@ -245,23 +256,43 @@ def main(spark: Any, config: Mapping) -> dict:
     Returns a summary dict for notebook display, including any unrecognized sentiment labels
     seen. The whole of bronze is rebuilt on every run: the tables are tiny, and a MERGE on
     ``(article_id, ticker)`` makes the rebuild idempotent.
+
+    Exactly one ``bronze.ingestion_runs`` row is written per call, on success and on failure,
+    the same as the ingestion tasks.
     """
     catalog = str(config["catalog"])
     source_fqn = qualified(catalog, SOURCE_TABLE)
     target_fqn = qualified(catalog, TARGET_TABLE)
+    run = RunRecord(run_id=new_run_id(), task=TASK_NAME, started_at=utc_now())
+    unknown_labels: list[str] = []
 
-    require_table(spark, source_fqn)
-    require_table(spark, target_fqn)
+    try:
+        require_table(spark, source_fqn)
+        require_table(spark, target_fqn)
 
-    unknown_labels = _warn_about_unknown_labels(spark, source_fqn)
-    rows_merged = merge_select(spark, target_fqn, build_source_sql(catalog), MERGE_KEYS)
+        unknown_labels = _warn_about_unknown_labels(spark, source_fqn)
+        run.rows_written = merge_select(spark, target_fqn, build_source_sql(catalog), MERGE_KEYS)
+    except BaseException as exc:
+        run.status = STATUS_FAILED
+        run.error = truncate_error(f"{type(exc).__name__}: {exc}")
+        raise
+    finally:
+        run.finished_at = utc_now()
+        record_run(spark, catalog, run)
 
-    log.info("%s complete rows_merged=%d target=%s", TASK_NAME, rows_merged, target_fqn)
+    log.info(
+        "%s complete run_id=%s rows_merged=%d target=%s",
+        TASK_NAME,
+        run.run_id,
+        run.rows_written,
+        target_fqn,
+    )
     return {
         "task": TASK_NAME,
+        "run_id": run.run_id,
         "source": source_fqn,
         "target": target_fqn,
-        "rows_merged": rows_merged,
+        "rows_merged": run.rows_written,
         "unknown_sentiment_labels": unknown_labels,
     }
 

@@ -94,20 +94,22 @@ CREATE TABLE IF NOT EXISTS market_intel.bronze.news_raw (
 USING DELTA
 COMMENT 'Near-raw Massive news, one row per (article, insight). MERGE on (article_id, ticker) — never a blind INSERT.';
 
--- One row per ingestion task run, written even when the run fails.
+-- One row per task run, written even when the run fails.
+-- Introduced at A-2 for the ingestion tasks and extended at A-4 to the pipeline tasks, so a
+-- workflow run leaves one audit row per task whatever that task does.
 -- error is redacted before it is stored: the API key travels as a query parameter, so raw
 -- exception text can carry a credential into a queryable table (A-1 security rule).
 CREATE TABLE IF NOT EXISTS market_intel.bronze.ingestion_runs (
   run_id       STRING    NOT NULL COMMENT 'UUID4 for this run. MERGE key.',
-  task         STRING    NOT NULL COMMENT 'Workflow task name: ingest_prices | ingest_news.',
+  task         STRING    NOT NULL COMMENT 'Task name: ingest_prices | ingest_news | build_silver_prices | build_silver_news | build_features.',
   started_at   TIMESTAMP          COMMENT 'UTC start.',
   finished_at  TIMESTAMP          COMMENT 'UTC end, set on success AND on failure.',
   status       STRING             COMMENT 'succeeded | failed.',
-  rows_written BIGINT             COMMENT 'Rows merged into the bronze table by this run (post-dedupe staged count).',
+  rows_written BIGINT             COMMENT 'Rows written by this run: rows merged into the target table (post-dedupe staged count).',
   error        STRING             COMMENT 'Redacted exception summary when status = failed, else NULL. Never a response body or a full URL.'
 )
 USING DELTA
-COMMENT 'Ingestion audit ledger (A-2). MERGE on (run_id).';
+COMMENT 'Run audit ledger for ingestion (A-2) and pipeline (A-4) tasks. MERGE on (run_id).';
 
 -- =====================================================================================
 -- SILVER (A-3) — implemented
@@ -154,10 +156,35 @@ COMMENT 'Normalized news, one row per (article, insight). MERGE on (article_id, 
 TBLPROPERTIES (delta.enableChangeDataFeed = true);
 
 -- =====================================================================================
--- SILVER FEATURES (A-4) — TODO: implement at checkpoint A-4.
--- silver.daily_features, grain (ticker, trade_date), trading days only (XNYS). Rows with null
--- rolling features stay in the table; the modeling layer drops them.
+-- SILVER FEATURES (A-4) — implemented
 -- =====================================================================================
+-- The contract between Spark and the modeling layer: models read this table for one ticker with a
+-- single .toPandas() and never touch bronze.
+--
+-- Grain is (ticker, trade_date) on XNYS trading days only. Rows whose rolling features are still
+-- warming up KEEP THEIR NULLS and stay in the table — dropping them here would hide how much
+-- history a feature needs, and the modeling layer drops them at read time instead.
+--
+-- Every rolling column is NULL until its window is genuinely full, because Spark aggregates skip
+-- NULLs and would otherwise report a 19-observation standard deviation as a 20-day one. That puts
+-- the first non-null at a known row: momentum_5d at row 5, realized_vol_20d at row 20, and
+-- volume_zscore_20d at row 19, one row earlier because volume has no undefined first row.
+CREATE TABLE IF NOT EXISTS market_intel.silver.daily_features (
+  ticker            STRING NOT NULL COMMENT 'MERGE key 1.',
+  trade_date        DATE   NOT NULL COMMENT 'XNYS session date. MERGE key 2.',
+  `close`           DOUBLE          COMMENT 'Session close, carried from daily_prices. The forecast layer reads the last value as current_price (B-4), so it must not require a second table.',
+  volume            BIGINT          COMMENT 'Shares traded, carried from daily_prices as the volume_zscore_20d input.',
+  log_return        DOUBLE          COMMENT 'ln(close / previous close). NULL on a ticker first row. The regime model estimates on this column, rescaled to percent (x100).',
+  return_5d         DOUBLE          COMMENT 'close / close 5 sessions ago - 1. NULL for the first 5 rows.',
+  momentum_5d       DOUBLE          COMMENT 'Sum of the last 5 log_returns. NULL until 5 non-null returns exist (row 5).',
+  realized_vol_20d  DOUBLE          COMMENT 'stddev_samp(log_return) over the trailing 20 rows. NULL until 20 non-null returns exist (row 20).',
+  volume_zscore_20d DOUBLE          COMMENT '(volume - mean_20) / stddev_20 over the trailing 20 rows including this one. NULL until row 19, and NULL when the window is constant (zero deviation).',
+  s_t               DOUBLE          COMMENT 'Mean sentiment_score of the articles assigned to this session, 0.0 when the session had none. Assignment rolls a closed-market timestamp FORWARD to the next XNYS session via the calendar, never by weekday arithmetic: an article published on Good Friday belongs to the following Monday.',
+  news_sentiment_3d DOUBLE          COMMENT 'Decayed sentiment (1.0*s_t + 0.5*s_t-1 + 0.25*s_t-2) / 1.75. Missing lags count as 0.0 because no news is a real zero. This is the exog_tvtp input, and the model shifts it one trading day before use (architecture 5).',
+  news_count        BIGINT          COMMENT 'Articles assigned to this session, 0 when none. Preserved so a sentiment value can be weighed against how much news produced it.'
+)
+USING DELTA
+COMMENT 'Model-ready features, grain (ticker, trade_date) on XNYS sessions. MERGE on (ticker, trade_date) — never a blind INSERT.';
 
 -- =====================================================================================
 -- GOLD (B-6, C-3) — TODO: implement at checkpoint B-6.
