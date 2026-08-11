@@ -1019,9 +1019,11 @@ def test_run_backtest_pools_across_tickers(backtest_frame):
 
 def test_models_package_never_imports_pyspark():
     """Hard rule: ``src/models/`` is pure pandas/numpy/statsmodels (spec rule 4, C-b)."""
+    # rglob, not glob, for the same reason as the smoothed-probabilities check: a non-recursive
+    # scan exempts any future subpackage under src/models/ without saying so.
     offenders = {
-        path.name
-        for path in sorted(MODELS_DIR.glob("*.py"))
+        str(path.relative_to(MODELS_DIR).as_posix())
+        for path in sorted(MODELS_DIR.rglob("*.py"))
         if re.search(r"^\s*(import|from)\s+pyspark", path.read_text(encoding="utf-8"), re.M)
     }
 

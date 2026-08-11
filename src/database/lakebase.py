@@ -42,6 +42,23 @@ Tables owned here: ``market_system.users``, ``market_system.watchlists``,
 in Delta history tables. That is the CDC demo: the agent writes a row in Postgres, and the
 change is captured through the WAL into the lakehouse.
 
+THIS MODULE IS APP-CONTAINER ONLY, and that is an environment fact, not a preference (C-1).
+``psycopg[binary]`` 3.3.4 SIGABRTs the serverless notebook kernel at IMPORT time — the libpq
+extension abort fires inside ``psycopg/pq/__init__.py`` ``import_from_libpq`` and the kernel exits
+134 before any of our code runs, so no try/except can contain it. The same package works inside a
+Databricks App container, where this pooled-OAuth pattern is proven.
+
+Consequences, all deliberate:
+
+- Nothing under ``src/ingestion/``, ``src/pipelines/`` or ``src/models/`` may import this module,
+  directly or transitively. ``tests/test_import_boundaries.py`` enforces it.
+- ``psycopg`` is NOT in ``requirements-databricks.txt``.
+- The schema was created through the SQL editor, since :func:`ensure_tables` cannot be called from
+  a notebook. It stays for the app's startup path and as the executable record of the DDL.
+
+The architecture already wanted this line: Lakebase is authoritative only for application state,
+and the pipelines deal exclusively in Delta.
+
 Deployment gotcha (spec C-2): a new Databricks App gets a new service principal that does not
 exist in Postgres yet. It needs a Postgres role created through the ``regime-market-database``
 project's OAuth tab plus explicit grants on ``market_system`` before first deploy. Without them

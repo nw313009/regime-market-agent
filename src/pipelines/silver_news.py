@@ -45,6 +45,18 @@ trailing separator, and an article with neither yields NULL rather than an empty
 
 MERGE on the composite key ``(article_id, ticker)``.
 
+``doc_id`` = ``article_id + ":" + ticker`` (added at C-1). It exists for ONE reason: an AI Search
+Delta Sync index needs a SINGLE unique primary key column, and this table's grain is
+``(article_id, ticker)``. Keying the index on ``article_id`` alone would let one row of a
+multi-ticker article win arbitrarily, so ``search_market_news("MSFT", ...)`` would report "no
+relevant news" for an article that exists — a silent retrieval hole rather than a visible error.
+It is derived, never ingested, and deterministic across re-runs because both inputs are the MERGE
+key, so a rebuild reproduces the same value. The MERGE key itself is UNCHANGED.
+
+Consequence, accepted and bounded: the embedding is computed per ROW, so a 3-ticker article
+embeds 3 times. That is already the shape of the insights explode (A-3), and at roughly 28k rows
+the cost is small.
+
 Change Data Feed must be enabled at table creation, because the AI Search index reads the Delta
 CDF::
 
@@ -110,6 +122,15 @@ EMBEDDING_TEXT_EXPR = (
     "nullif(concat_ws('\\n', nullif(trim(title), ''), nullif(trim(description), '')), '')"
 )
 
+#: Separator between the two halves of ``doc_id``. A colon, not the vendor's own alphabet: the
+#: article id is 64 hex characters and a ticker is A-Z with dots and dashes, so ':' cannot appear
+#: in either half and the id stays unambiguously splittable.
+DOC_ID_SEPARATOR = ":"
+
+#: The AI Search primary key (C-1). ``concat`` returns NULL if either half is NULL, which is
+#: correct: both halves are NOT NULL MERGE keys, so a NULL here means the row should not exist.
+DOC_ID_EXPR = f"concat(article_id, '{DOC_ID_SEPARATOR}', ticker)"
+
 #: Parse the raw ISO-8601 string, per spec. ``source_timestamp`` is the same instant, already
 #: parsed in Python at ingestion, so it is an exact fallback if Spark ever rejects a vendor form.
 PUBLISHED_AT_EXPR = "coalesce(try_to_timestamp(published_utc), source_timestamp)"
@@ -144,6 +165,8 @@ PROJECTIONS = (
     ("sentiment_reasoning", "sentiment_reasoning"),
     ("embedding_text", EMBEDDING_TEXT_EXPR),
     ("article_url", "article_url"),
+    # Last, matching the DDL, which matches the migrated table: ALTER TABLE ADD COLUMN appends.
+    ("doc_id", DOC_ID_EXPR),
 )
 
 NEWS_ARTICLE_COLUMNS = tuple(name for name, _ in PROJECTIONS)
@@ -193,6 +216,16 @@ def unknown_sentiment_labels(labels: Iterable[Any]) -> list[str]:
         if normalized is not None and normalized not in SENTIMENT_SCORES
     }
     return sorted(unknown)
+
+
+def build_doc_id(article_id: Any, ticker: Any) -> str:
+    """``article_id:ticker`` — the AI Search index primary key (C-1).
+
+    Mirrors :data:`DOC_ID_EXPR`. Deterministic by construction: both inputs are MERGE keys, so
+    re-running the build against the same bronze row produces the same id and the index sync
+    updates in place instead of accumulating orphans.
+    """
+    return f"{article_id}{DOC_ID_SEPARATOR}{ticker}"
 
 
 def build_embedding_text(title: Any, description: Any) -> str | None:

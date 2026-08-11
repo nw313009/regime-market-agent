@@ -123,7 +123,8 @@ regime-market-agent/
 │                   test_no_lookahead.py | test_agent_tools.py | test_idempotency.py |
 │                   test_massive_client.py | test_ingestion.py | test_silver.py |
 │                   test_call_model.py | test_telemetry.py | test_lakebase.py |
-│                   conftest.py
+│                   test_agent_loop.py | test_ai_search.py |
+│                   test_import_boundaries.py | conftest.py
 │                   # test_massive_client/test_ingestion/test_silver/conftest added at A-1/A-2/A-3:
 │                   # the vendor client, the ingestion watermark/row-building logic and the silver
 │                   # derivations had no home in the original list, and conftest.py holds the
@@ -131,12 +132,18 @@ regime-market-agent/
 │                   # added at C-2/C-3 for the same reason: C-7 names only test_agent_tools, which
 │                   # is the agent's integration test, and the model wrapper, the telemetry buffer
 │                   # and the Postgres access layer are all unit-testable without a workspace.
+│                   # test_agent_loop/test_ai_search/test_import_boundaries added at C-1/C-4: the
+│                   # loop's iteration cap and the setup script's idempotency are exactly the
+│                   # properties an integration test cannot demonstrate cheaply (you would have to
+│                   # provoke a runaway model and re-create a populated index), and the psycopg
+│                   # import boundary is a static property of the source tree, not of a run.
 ├── config/config.yaml
 ├── requirements.txt              # local 3.12 venv, fully pinned (dev + pytest)
 └── requirements-databricks.txt   # ONLY packages the Databricks runtime lacks:
                                   # statsmodels, exchange_calendars,
-                                  # databricks-sql-connector, psycopg[binary,pool]
+                                  # databricks-sql-connector
                                   # (+ databricks-sdk as a version floor, not an absence)
+                                  # psycopg REMOVED at C-1 — see the environment note below
 
 Dependency environments are split three ways, recorded here under rule 2 (spec silent →
 simplest working option). requirements.txt fully pins the local Python 3.12 dev/test venv —
@@ -145,7 +152,7 @@ psycopg[binary,pool], databricks-sdk, streamlit, requests, pyyaml, pytest — wi
 statsmodels==0.14.6 as a hard floor, since earlier versions fail to import under pandas 3.0;
 it is never installed on a cluster. requirements-databricks.txt is what notebooks and job
 environments install, and lists only what the runtime lacks (statsmodels,
-exchange_calendars, databricks-sql-connector, psycopg[binary,pool]) plus databricks-sdk,
+exchange_calendars, databricks-sql-connector) plus databricks-sdk,
 which the runtime does ship but often below the >=0.125.0 floor that
 w.postgres.generate_database_credential requires: NEVER pip-upgrade pandas, numpy or pyarrow
 on a cluster, because the runtime pins those three against its own Spark build and replacing
@@ -156,12 +163,44 @@ no statsmodels. Lakebase uses psycopg v3 rather than psycopg2 because the proven
 pattern (C-2) depends on psycopg_pool.ConnectionPool with per-connection OAuth credentials.
 The frozen architecture doc is silent on dependency files and is unaffected by this split.
 
+ENVIRONMENT NOTE (C-1): psycopg KILLS THE SERVERLESS NOTEBOOK KERNEL, so Lakebase is
+app-container-only.
+
+Symptom, observed: `import psycopg` (psycopg[binary] 3.3.4) on serverless compute aborts the
+kernel at import time. The libpq extension abort fires inside psycopg/pq/__init__.py
+import_from_libpq and the process exits 134 (SIGABRT). It is not an exception — no traceback,
+no try/except, nothing of ours runs. The same package works in the Databricks App container,
+where the pooled-OAuth pattern is proven, and in the local venv.
+
+Boundary, enforced: psycopg is removed from requirements-databricks.txt; src/database/lakebase.py
+is imported only by the app and by src/agent/tools.py's two WRITE tools, which import it inside
+the function rather than at module level; nothing under src/ingestion, src/pipelines or
+src/models may reach it through any chain of first-party imports. tests/test_import_boundaries.py
+walks the import graph and asserts all of that, including that `import src.agent.tools` (for the
+tool schemas, or from a notebook) pulls in no psycopg.
+
+This costs nothing architecturally: Lakebase is authoritative only for application state and the
+pipelines deal exclusively in Delta. The one operational consequence is that ensure_tables()
+cannot be called from a notebook, so the market_system schema was created by running
+setup/create_lakebase.sql in the SQL editor — all four tables exist and REPLICA IDENTITY FULL is
+verified on watchlist_tickers and research_reports. ensure_tables() stays for the app's startup
+path and as the executable record of the DDL.
+
 config.yaml keys: massive.base_url, massive.rate_limit_per_min,
 massive.backfill_start_date="2024-08-01", tickers.seed[5],
 forecast.horizon_days=5, forecast.n_paths=5000, forecast.seed=42,
 news.half_life_days=2, backtest.min_train_days=252, backtest.origin_freq=weekly,
 backtest.n_weeks=26, model.agent_endpoint, model.slm_endpoint (unused until stretch),
-catalog=market_intel, telemetry.mode (added at C-3).
+catalog=market_intel, telemetry.mode (added at C-3), search.* (added at C-1).
+
+search.* was added at C-1 because the original key list names the index but not the knobs around
+it: search.endpoint_name, search.index, search.source_table, search.primary_key,
+search.embedding_source_column, search.embedding_model_endpoint, search.top_k. Table names are
+stored catalog-relative and prefixed with `catalog` at the edge, exactly as in the pipelines, so
+pointing the project at a second catalog stays a one-line change. Two modules read the section —
+setup/create_ai_search.py to build the index and src/agent/tools.py to query it — and
+tests/test_agent_tools.py asserts they resolve the same index name, since drift there would have
+the agent querying an index nothing creates.
 
 telemetry.mode was added at C-3 because the original key list predates the question of where
 model-call telemetry goes, and there is no single answer: the spec's destination is a Delta
@@ -255,9 +294,29 @@ parsing step differs; the session rule does not.
 
 silver.news_articles — article_id, ticker, published_at, title, description,
 publisher, sentiment_label, sentiment_score, sentiment_reasoning,
-embedding_text (= title + "\n" + description), article_url.
+embedding_text (= title + "\n" + description), article_url, doc_id (added at C-1).
 MERGE on the composite key (article_id, ticker). CDF at creation:
   TBLPROPERTIES (delta.enableChangeDataFeed = true)
+
+doc_id = article_id || ":" || ticker, derived in the silver build. It exists for one reason: an
+AI Search Delta Sync index takes exactly ONE primary key column and this table is grained on
+(article_id, ticker). Keying the index on article_id alone would let one row of a multi-ticker
+article win arbitrarily, so search_market_news("MSFT", ...) would answer "no relevant news" for
+an article that exists — a silent retrieval hole rather than a visible error. Deterministic
+across re-runs, because both inputs are the MERGE key. The MERGE key itself is UNCHANGED.
+
+Accepted cost: the embedding is computed per ROW, so a 3-ticker article embeds 3 times. That is
+already the shape of the insights explode, and at roughly 28k rows it is bounded and small.
+
+Migration, since the table was already populated when the column was added: CREATE TABLE IF NOT
+EXISTS does not alter an existing table, so setup/create_delta_tables.sql carries an ALTER TABLE
+... ADD COLUMN IF NOT EXISTS doc_id after the CREATE. No backfill UPDATE is needed — the build's
+staged SELECT projects doc_id and the MERGE's WHEN MATCHED THEN UPDATE SET * rewrites every
+matched row, so the next run populates the whole table. (UPDATE SET * and INSERT * match by NAME,
+which is also why the source SELECT must project the column: with schema evolution off, a target
+column missing from the source fails the INSERT rather than defaulting to NULL.) Adding a column
+to a CDF-enabled table is safe: the existing feed is not invalidated and changes written
+afterwards carry the new column.
 
 EXPLODE FROM insights, NOT tickers. Each article carries both a tickers array and an
 insights array of {ticker, sentiment, sentiment_reasoning}. Sentiment exists only inside
@@ -444,6 +503,10 @@ test_tvtp_no_lookahead — fit + forecast at origin T; then corrupt all
   news_sentiment_3d after T with random values; refit/forecast; assert bit-identical
   ForecastSummary. Also assert grep-level: no reference to
   smoothed_marginal_probabilities under src/models/.
+  The grep scan uses rglob, not glob (changed at C-1 after Gate 2 review): a non-recursive scan
+  silently exempts any future subpackage under src/models/, and "the leak test passed because it
+  never looked" is the worst way for this check to fail. The pyspark-boundary scan in
+  test_models.py was fixed the same way.
 test_mc_seed — same seed → identical percentiles; different seed → different.
 test_fallback — inject a FitError from C; assert B used and recorded.
 
@@ -454,6 +517,28 @@ setup/create_ai_search.py: create endpoint (one, STANDARD); create Delta Sync in
 market_intel.silver.news_index on silver.news_articles, embedding source column
 embedding_text (managed embeddings), sync mode TRIGGERED. sync_news_index task in the
 workflow triggers it. Query path: hybrid search, filter by ticker, top_k≈5.
+
+Decisions taken where the above is silent (C-1 implementation):
+- PRIMARY KEY is the derived doc_id (article_id:ticker), not article_id. An index takes one key
+  column and this table has a composite grain; see the A-3 note for the retrieval hole that
+  article_id would open and the migration the new column needed.
+- IDEMPOTENT BY ASKING FIRST. ensure_endpoint and ensure_index look the resource up and return
+  the existing one untouched, catching ResourceAlreadyExists for the overlapping-run case. The
+  index is NEVER re-created: dropping a populated one discards every embedding and re-embeds the
+  table. A misconfigured index has to be deleted deliberately, by hand.
+- index_subtype=HYBRID, matching the query path. The SDK documents VECTOR as unsupported.
+- columns_to_sync is explicit rather than "all columns": it is exactly what search_market_news
+  returns, so description and sentiment_reasoning (both long) stay out of the index and the
+  snippet is cut from embedding_text, which already begins with the title. test_ai_search.py
+  asserts every synced column exists in the silver projection, because a typo here fails at sync
+  time in the workspace rather than at edit time.
+- wait_until_ready is hand-rolled with a deadline: the SDK ships a waiter for the endpoint but
+  not for the index, and a wait with no deadline is how a notebook hangs overnight. Readiness is
+  the property that matters — an index that exists but is not ready errors on query rather than
+  returning zero results.
+- SDK surface was verified against the installed databricks-sdk 0.125.0 rather than recalled:
+  w.vector_search_endpoints (get_endpoint / create_endpoint / the ONLINE waiter) and
+  w.vector_search_indexes (get_index / create_index / sync_index / query_index).
 
 ### C-2 Lakebase
 INSTANCE. The capstone gets its OWN Lakebase project: regime-market-database, Autoscaling
@@ -564,7 +649,34 @@ append results; stop when the model returns a final text answer.
 prompts.py — system prompt requirements: role (market research explainer); MUST call
 get_market_forecast before making quantitative claims; MUST ground news claims in
 search results and mention article titles; NEVER invent numbers; NEVER give buy/sell
-advice; confirm writes it performs.
+advice; confirm writes it performs; state the news-decay assumption when explaining a
+forecast's news conditioning.
+
+Decisions taken where the above is silent (C-4 implementation):
+- Gold is read over the SQL WAREHOUSE, not Spark: the app hosting the agent has no SparkSession.
+  src/database/delta.py implements that path (databricks-sql-connector, :name parameters bound
+  server-side, one connection per call). Identifiers come from config; every value is bound.
+- get_market_forecast takes the most recent as_of_date and, when several models wrote that date,
+  prefers news_markov > markov > gbm. The spec says any model_used; ordering by the column
+  alphabetically would systematically surface gbm, the bottom rung of the fallback ladder. The
+  regime row is matched on the forecast's OWN (ticker, as_of_date), so the pair always describes
+  the same fit.
+- A ticker with no forecast returns {"found": false, ...} rather than raising. "No forecast has
+  been computed for AMD yet" is a true answer the agent must be able to give, and it is the
+  normal state for a ticker the CDC demo added minutes ago. Same for a search with no hits.
+- Every tool returns a JSON-serializable dict: the result becomes a tool message, and a date or a
+  Decimal would fail at serialization time, mid-turn.
+- Tickers are validated (the same rule as lakebase.py) before any query or write, so "add tesla
+  to my list" fails as an argument error the model can correct rather than as a stored row.
+- The loop treats a TOOL failure as a result — the error text goes back to the model, which can
+  retry or explain — and lets a MODEL failure propagate, since there is nothing to recover with.
+- The iteration cap ends the turn with an explicit "I could not finish" and sets
+  hit_iteration_limit. The failure it prevents is a confident answer assembled from nothing.
+- Telemetry is not recorded by the loop: call_model already writes one record per call (C-3), and
+  a second record per turn would double-count. test_agent_loop.py asserts the records exist by
+  running the real call_model over a fake HTTP session.
+- The system prompt interpolates news.half_life_days from config rather than stating "2 days" in
+  prose, so changing the config cannot leave the agent describing the old behaviour.
 
 ### C-5 Streamlit app
 Reads Delta via databricks-sql-connector (serverless SQL warehouse), Lakebase via the
@@ -585,6 +697,12 @@ ingestion tasks, sync_news_index last.
 test_agent_tools — each write tool call produces the expected Lakebase row
 (integration test against real Lakebase); read tools return schema-valid payloads.
 Manual end-to-end: the A4 demo script, once, before calling C frozen.
+
+The live round trip is kept runnable and opt-in (AGENT_LIVE_TEST=1), like the Lakebase one, since
+it needs a warehouse, an index and a Postgres role. The fake-backed tests alongside it assert
+what an integration test cannot: the exact SQL text and its bound parameters, the index filter
+document, and the four JSON schemas against their handlers' signatures — a drifted schema fails
+at model-call time, and a value interpolated into a query still returns the right row.
 
 ## CHECKPOINT D — Polish only
 README with architecture diagram; screenshots; demo script; telemetry mini-view;
@@ -636,5 +754,9 @@ MarkovRegression all-NaN params → returns not scaled to %; or NaNs left in end
 Backtest wildly good → you leaked: check smoothed-probs grep test and TVTP lag test.
 App can't read Delta → warehouse id/permissions in app.yaml, not your code.
 Index empty after sync → CDF property missing on news_articles at creation time.
+Notebook kernel dies, exit 134, no traceback → something imported psycopg on serverless. It
+  SIGABRTs in libpq at import; Lakebase is app-container-only (see the B0 environment note).
+Ticker-filtered news search finds nothing for a multi-ticker article → doc_id is NULL or the
+  index is keyed on article_id; re-run build_silver_news, then trigger a sync.
 
 END OF SPEC. Build order within each checkpoint follows document order.

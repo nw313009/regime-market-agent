@@ -61,7 +61,17 @@ REQUIRED_ATTRIBUTE = "filtered_marginal_probabilities"
 
 
 def _model_sources() -> dict[str, str]:
-    sources = {path.name: path.read_text(encoding="utf-8") for path in MODELS_DIR.glob("*.py")}
+    """Every modeling source, RECURSIVELY.
+
+    rglob, not glob: a non-recursive scan silently exempts any future subpackage under
+    ``src/models/``, and "the leak test passes because it never looked" is the worst way for this
+    check to fail. Keys are paths relative to ``src/models`` so an offender in a subpackage is
+    identifiable.
+    """
+    sources = {
+        str(path.relative_to(MODELS_DIR).as_posix()): path.read_text(encoding="utf-8")
+        for path in MODELS_DIR.rglob("*.py")
+    }
     assert sources, f"no modeling sources found under {MODELS_DIR}"
     return sources
 

@@ -55,6 +55,26 @@ model:
   agent_endpoint: databricks-meta-llama-3-3-70b-instruct
   slm_endpoint: databricks-meta-llama-3-1-8b-instruct
 
+search:
+  # Added at C-1; the B0 key list names the index but not the knobs around it. Table names are
+  # catalog-relative, like every other table reference in the code — `catalog` above supplies the
+  # prefix, so pointing the whole project at a different catalog stays a one-line change.
+  endpoint_name: market-intel-search
+  index: silver.news_index
+  source_table: silver.news_articles
+  # The single unique key an AI Search index requires. silver.news_articles is grained on
+  # (article_id, ticker), so this is the derived doc_id column, not article_id (C-1).
+  primary_key: doc_id
+  # Managed embeddings: Databricks computes the vectors from embedding_text at sync time, so
+  # nothing in this repo generates or stores an embedding.
+  embedding_source_column: embedding_text
+  # A Databricks-hosted pay-per-token embedding endpoint, present in the workspace by default.
+  # TODO: if this endpoint is absent, `databricks-bge-large-en` is the other stock choice.
+  embedding_model_endpoint: databricks-gte-large-en
+  # Default k for search_market_news. Small on purpose: the agent has to name the titles it used,
+  # and a long list invites hand-waving over specifics.
+  top_k: 5
+
 telemetry:
   # Added at C-3; the B0 key list predates the telemetry destination question. Where
   # src/llm/telemetry.py sends the one record it appends per model call:

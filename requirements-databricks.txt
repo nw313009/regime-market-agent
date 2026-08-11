@@ -34,10 +34,22 @@ exchange_calendars==4.13.2
 # Delta access over a serverless SQL warehouse, for code paths shared with the app.
 databricks-sql-connector==4.4.0
 
-# Lakebase (Postgres) access. psycopg v3 plus the pool extra — the pattern uses
-# psycopg_pool.ConnectionPool with per-connection OAuth tokens, so [pool] is not optional.
-psycopg[binary,pool]==3.3.4
-
 # Version floor, not a missing package (see the note above): needed for
 # w.postgres.generate_database_credential.
 databricks-sdk>=0.125.0
+
+# NO psycopg HERE — REMOVED AT C-1, AND IT MUST NOT COME BACK.
+# psycopg[binary] 3.3.4 SIGABRTs the serverless notebook kernel at IMPORT time: the libpq
+# extension abort fires inside psycopg/pq/__init__.py import_from_libpq and the kernel dies with
+# exit code 134, before any code of ours runs. It is not a query failure and there is no
+# try/except that catches it.
+#
+# The boundary this forces: Lakebase access (src/database/lakebase.py) is APP-CONTAINER ONLY,
+# where the same package works and the pooled-OAuth pattern is proven. Notebooks and workflow
+# tasks never touch Postgres — they read and write Delta, which is the architecture anyway
+# (Lakebase is authoritative only for application state). The schema was created through the SQL
+# editor rather than by calling ensure_tables() from a notebook.
+#
+# tests/test_import_boundaries.py enforces it: no module under src/ingestion, src/pipelines or
+# src/models may reach psycopg through any chain of first-party imports. Adding psycopg back to
+# this file would put the abort one stray import away from killing a workflow task.

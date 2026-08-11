@@ -10,7 +10,7 @@
 --                                                      MERGE (ticker, trade_date)
 -- silver.news_articles    article_id, ticker, published_at, title, description, publisher,
 --                         sentiment_label, sentiment_score, sentiment_reasoning,
---                         embedding_text, article_url.
+--                         embedding_text, article_url, doc_id.
 --                                                      MERGE (article_id, ticker)
 --   MUST be created with Change Data Feed enabled, because the AI Search Delta Sync index
 --   reads the CDF. Missing this at creation time is why an index comes back empty:
@@ -156,11 +156,27 @@ CREATE TABLE IF NOT EXISTS market_intel.silver.news_articles (
   sentiment_score     INT             COMMENT 'DERIVED here: positive=+1, neutral=0, negative=-1, unrecognized=0 with a logged warning. daily_features.s_t consumes this unchanged.',
   sentiment_reasoning STRING          COMMENT 'Raw vendor reasoning text, kept for agent and UI display.',
   embedding_text      STRING          COMMENT 'title + newline + description, description omitted when absent. Embedding source column for the AI Search index.',
-  article_url         STRING          COMMENT 'Passed through from bronze.'
+  article_url         STRING          COMMENT 'Passed through from bronze.',
+  doc_id              STRING          COMMENT 'DERIVED at C-1: article_id || ":" || ticker. PRIMARY KEY OF THE AI SEARCH INDEX, which allows only one key column while this table is grained on (article_id, ticker). Keying the index on article_id alone would let one row of a multi-ticker article win arbitrarily, and the ticker-filtered search would then miss it. Deterministic across re-runs because both inputs are MERGE keys. NOT the table MERGE key, which is unchanged.'
 )
 USING DELTA
 COMMENT 'Normalized news, one row per (article, insight). MERGE on (article_id, ticker) — never a blind INSERT.'
 TBLPROPERTIES (delta.enableChangeDataFeed = true);
+
+-- MIGRATION for the already-populated table (C-1). CREATE TABLE IF NOT EXISTS does not alter an
+-- existing table, so the column has to be added explicitly. Run this once; it is a no-op
+-- afterwards.
+--
+-- No backfill UPDATE is needed: build_silver_news projects doc_id in its staged SELECT and the
+-- MERGE's WHEN MATCHED THEN UPDATE SET * rewrites every matched row, so the next run populates
+-- the whole table. (UPDATE SET * / INSERT * match by NAME, which is also why the source SELECT
+-- must project doc_id — with schema evolution off, a target column missing from the source fails
+-- the INSERT rather than defaulting to NULL.)
+--
+-- Adding a column to a CDF-enabled table is safe: Change Data Feed handles the schema change, the
+-- existing feed is not invalidated, and changes written after this point carry the new column.
+ALTER TABLE market_intel.silver.news_articles
+  ADD COLUMN IF NOT EXISTS doc_id STRING COMMENT 'DERIVED at C-1: article_id || ":" || ticker. Primary key of the AI Search index.';
 
 -- =====================================================================================
 -- SILVER FEATURES (A-4) — implemented

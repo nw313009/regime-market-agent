@@ -25,12 +25,14 @@ import pytest
 from src.ingestion.ingest_prices import epoch_ms_to_session_date
 from src.pipelines import latest_per_key_sql, merge_sql
 from src.pipelines.silver_news import (
+    DOC_ID_EXPR,
     EMBEDDING_TEXT_EXPR,
     EMBEDDING_TEXT_SEPARATOR,
     NEWS_ARTICLE_COLUMNS,
     PUBLISHED_AT_EXPR,
     SENTIMENT_SCORES,
     UNKNOWN_SENTIMENT_SCORE,
+    build_doc_id,
     build_embedding_text,
     normalize_sentiment_label,
     sentiment_score,
@@ -342,9 +344,39 @@ def test_news_source_sql_projects_exactly_the_table_columns():
         "sentiment_reasoning",
         "embedding_text",
         "article_url",
+        "doc_id",
     )
     for column in NEWS_ARTICLE_COLUMNS:
         assert f"`{column}`" in sql
+
+
+def test_doc_id_is_the_article_and_ticker_joined():
+    assert build_doc_id("a" * 64, "NVDA") == f"{'a' * 64}:NVDA"
+
+
+def test_doc_id_sql_mirrors_the_python_rule():
+    sql = build_news_source_sql(CATALOG)
+
+    assert DOC_ID_EXPR == "concat(article_id, ':', ticker)"
+    assert f"{DOC_ID_EXPR} AS `doc_id`" in sql
+
+
+def test_doc_id_is_unique_per_row_where_article_id_is_not():
+    # The reason the column exists: an AI Search index takes ONE primary key column, and a
+    # multi-ticker article occupies several rows of this table.
+    rows = [("abc", "NVDA"), ("abc", "MSFT")]
+    doc_ids = {build_doc_id(article_id, ticker) for article_id, ticker in rows}
+
+    assert len({article_id for article_id, _ in rows}) == 1
+    assert len(doc_ids) == 2
+
+
+def test_the_ddl_migrates_the_existing_news_table():
+    # CREATE TABLE IF NOT EXISTS does not alter a populated table, so the column needs an ALTER.
+    text = DDL_PATH.read_text(encoding="utf-8")
+
+    assert "ALTER TABLE market_intel.silver.news_articles" in text
+    assert "ADD COLUMN IF NOT EXISTS doc_id STRING" in text
 
 
 def test_news_source_sql_maps_publisher_and_label_from_bronze_columns():
