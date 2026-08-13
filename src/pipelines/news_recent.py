@@ -19,6 +19,13 @@ halves of the decision cannot drift apart.
 WHY A TABLE AND NOT A VIEW: see the DDL comment. The page runs this query on every rerun over a
 serverless warehouse; a view would re-scan the growing archive each time.
 
+IT IS ALSO THE INDEXED CORPUS (C-1). ``search.source_table`` points at this table, so the window
+is what the agent can retrieve and rows aging out here disappear from the index on the next sync.
+Two consequences live in this module: :data:`COLUMNS` carries ``doc_id`` and ``embedding_text``,
+which the page never displays, and :func:`unchanged_predicate` keeps the daily refresh from
+rewriting rows that did not change — a rewritten row is a Change Data Feed event, and a feed event
+is an embedding call.
+
 DATES ARE FORMATTED, NOT INTERPOLATED. The MERGE source is SQL text, so there is no parameter
 marker to bind — :func:`_date_literal` therefore takes a ``datetime.date`` and refuses anything
 else, which makes the value unforgeable by construction rather than by review. Every date here
@@ -60,6 +67,7 @@ __all__ = [
     "retention_floor",
     "settings_from_config",
     "source_sql",
+    "unchanged_predicate",
     "window_start",
 ]
 
@@ -73,6 +81,10 @@ TARGET_TABLE = "silver.news_recent"
 
 #: Exactly the target's columns, in DDL order. ``MERGE ... UPDATE SET * / INSERT *`` matches by
 #: NAME, so a column missing from this projection fails the write rather than defaulting to NULL.
+#:
+#: ``embedding_text`` and ``doc_id`` are here for the AI Search index, not for the page: the index
+#: is built on this table (C-1), and a Delta Sync index needs its embedding source column and its
+#: single primary key column present in the source.
 COLUMNS: tuple[str, ...] = (
     "article_id",
     "ticker",
@@ -82,6 +94,8 @@ COLUMNS: tuple[str, ...] = (
     "sentiment_label",
     "sentiment_score",
     "article_url",
+    "embedding_text",
+    "doc_id",
 )
 
 MERGE_KEYS: tuple[str, ...] = ("article_id", "ticker")
@@ -150,6 +164,39 @@ def next_backfill_window(
     return start, end
 
 
+def unchanged_predicate(catalog: str, alias: str = "a", target: str = "held") -> str:
+    """``NOT EXISTS (...)``: true for a source row the target does not already hold verbatim.
+
+    THIS IS WHAT STOPS THE INDEX RE-EMBEDDING ITSELF EVERY NIGHT. The daily refresh re-presents the
+    whole 90-day window, and ``WHEN MATCHED THEN UPDATE SET *`` rewrites every matched row whether
+    or not a value differs. Delta records those rewrites in the Change Data Feed, the AI Search
+    Delta Sync index (C-1) reads that feed, and managed embeddings re-embed whatever the feed says
+    changed — so the naive refresh would pay to re-embed several thousand unchanged articles daily
+    and leave the index resyncing for minutes each run.
+
+    Comparison is ``<=>`` (null-safe) on EVERY non-key column, not just the embedding source, so a
+    corrected sentiment label or a fixed title still propagates. Only rows where nothing at all
+    moved are skipped. The anti-join costs a join of the window against itself; the alternative
+    costs an embedding call per row per day.
+
+    The target alias is ``held``, not ``t``: this text is embedded in a ``MERGE ... AS t``, and an
+    inner ``t`` would shadow the target alias for anyone reading — or editing — the statement.
+    """
+    source_fqn = qualified(catalog, TARGET_TABLE)
+    keys = " AND ".join(
+        f"{target}.{quote_identifier(key)} = {alias}.{quote_identifier(key)}" for key in MERGE_KEYS
+    )
+    payload = "".join(
+        f"\n         AND {target}.{quote_identifier(column)} <=> {alias}.{quote_identifier(column)}"
+        for column in COLUMNS
+        if column not in MERGE_KEYS
+    )
+    return (
+        f"NOT EXISTS (SELECT 1 FROM {source_fqn} AS {target}\n"
+        f"       WHERE {keys}{payload})"
+    )
+
+
 def source_sql(catalog: str, start: date, end: date | None = None) -> str:
     """The projection of ``silver.news_articles`` for one window, as MERGE source text.
 
@@ -159,15 +206,22 @@ def source_sql(catalog: str, start: date, end: date | None = None) -> str:
     Rows with a NULL ``published_at`` are excluded by the comparison itself and that is correct —
     an article with no publication time cannot be placed in a window, and the app's list is
     ordered by that column.
+
+    Rows the target already holds unchanged are excluded too; see :func:`unchanged_predicate`. The
+    consequence for the ledger is that ``rows_written`` counts what actually moved, not the size of
+    the window — which is the more useful number anyway, and the one a "nothing happened today" run
+    reports as zero.
     """
-    projection = ",\n       ".join(quote_identifier(column) for column in COLUMNS)
-    bounds = f"{WINDOW_COLUMN} >= {_date_literal(start)}"
+    alias = "a"
+    projection = ",\n       ".join(f"{alias}.{quote_identifier(column)}" for column in COLUMNS)
+    bounds = f"{alias}.{WINDOW_COLUMN} >= {_date_literal(start)}"
     if end is not None:
-        bounds += f"\n  AND {WINDOW_COLUMN} < {_date_literal(end)}"
+        bounds += f"\n  AND {alias}.{WINDOW_COLUMN} < {_date_literal(end)}"
     return (
         f"SELECT {projection}\n"
-        f"FROM {qualified(catalog, SOURCE_TABLE)}\n"
-        f"WHERE {bounds}"
+        f"FROM {qualified(catalog, SOURCE_TABLE)} AS {alias}\n"
+        f"WHERE {bounds}\n"
+        f"  AND {unchanged_predicate(catalog, alias=alias)}"
     )
 
 

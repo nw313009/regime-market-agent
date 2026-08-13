@@ -178,14 +178,28 @@ TBLPROPERTIES (delta.enableChangeDataFeed = true);
 ALTER TABLE market_intel.silver.news_articles
   ADD COLUMN IF NOT EXISTS doc_id STRING COMMENT 'DERIVED at C-1: article_id || ":" || ticker. Primary key of the AI Search index.';
 
--- The app's news list (C-5). A MATERIALIZED ROLLING WINDOW over silver.news_articles, not a view.
+-- The app's news list (C-5) AND the source of the AI Search index (C-1). A MATERIALIZED ROLLING
+-- WINDOW over silver.news_articles, not a view.
 --
 -- Why it exists: the Market Research page runs its news query on every rerun, over a serverless
 -- warehouse, for a user who is watching. news_articles grows without bound and carries two long
--- text columns the page never shows; this table holds the recent slice and only the displayed
--- columns, so the page reads a few hundred rows instead of scanning the archive. It is a cache
--- with an owner (the refresh_news_recent task), which is why it is a table and not a view — a
--- view would re-scan the archive on every page load and defeat the point.
+-- text columns the page never selects; this table holds the recent slice, so the page reads a few
+-- hundred rows instead of scanning the archive. It is a cache with an owner (the
+-- refresh_news_recent task), which is why it is a table and not a view — a view would re-scan the
+-- archive on every page load and defeat the point.
+--
+-- IT IS ALSO THE INDEXED CORPUS. search.source_table points here rather than at news_articles, so
+-- the index inherits the window: a row that ages out is deleted here and the next sync removes it
+-- there. That bounds the embedding spend and guarantees the agent and the page see the same
+-- articles. Hence the two extra columns below (doc_id, embedding_text), which the page never
+-- displays and the index cannot work without.
+--
+-- CHANGE DATA FEED IS MANDATORY AT CREATION TIME, for the reason given on news_articles above: a
+-- Delta Sync index reads the feed, and turning the property on later does not backfill it. This
+-- table is a CACHE, so if it already exists without CDF the fix is DROP TABLE and re-run
+-- refresh_news_recent — there is nothing here that news_articles cannot rebuild. That is not true
+-- of any other table in this file, and it is why this one gets a drop-and-rebuild instruction
+-- instead of an ALTER.
 --
 -- WINDOW SEMANTICS. refresh_news_recent MERGEs the last news_recent.window_days (90) of
 -- news_articles and deletes rows older than the retention floor. The floor is normally
@@ -194,16 +208,19 @@ ALTER TABLE market_intel.silver.news_articles
 -- See src/pipelines/news_recent.py, which owns that single rule.
 CREATE TABLE IF NOT EXISTS market_intel.silver.news_recent (
   article_id      STRING NOT NULL COMMENT 'From silver.news_articles. MERGE key 1.',
-  ticker          STRING NOT NULL COMMENT 'From silver.news_articles. MERGE key 2.',
+  ticker          STRING NOT NULL COMMENT 'From silver.news_articles. MERGE key 2. Also the index filter column: search_market_news filters on it.',
   published_at    TIMESTAMP       COMMENT 'Publication instant. The window column: retention and backfill are both expressed against it.',
   title           STRING          COMMENT 'Displayed by the page and named by the agent when it cites an article.',
   publisher       STRING          COMMENT 'Displayed next to the title, so a reader can weigh the source.',
   sentiment_label STRING          COMMENT 'Raw vendor label, displayed as-is.',
   sentiment_score INT             COMMENT 'The +1/0/-1 derivation, for the aggregate tone line the page shows above the list.',
-  article_url     STRING          COMMENT 'Link target for the headline.'
+  article_url     STRING          COMMENT 'Link target for the headline.',
+  embedding_text  STRING          COMMENT 'Carried from silver.news_articles for the index (C-1): the embedding source column, from which Databricks computes the vector at sync time. The page never selects it.',
+  doc_id          STRING          COMMENT 'Carried from silver.news_articles for the index (C-1): its single primary key column, article_id || ":" || ticker. NOT the MERGE key of this table, which stays (article_id, ticker).'
 )
 USING DELTA
-COMMENT 'Rolling recent-news window for the app (C-5). MERGE on (article_id, ticker) — never a blind INSERT. Derived from silver.news_articles; never written by ingestion.';
+COMMENT 'Rolling recent-news window for the app and the AI Search index (C-5/C-6). MERGE on (article_id, ticker) — never a blind INSERT. Derived from silver.news_articles; never written by ingestion; safe to DROP and rebuild.'
+TBLPROPERTIES (delta.enableChangeDataFeed = true);
 
 -- =====================================================================================
 -- SILVER FEATURES (A-4) — implemented

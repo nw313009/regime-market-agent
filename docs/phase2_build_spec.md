@@ -42,7 +42,8 @@ Scheduled once daily after US market close (suggest 22:30 UTC), plus manual "Run
 6. run_forecasts    — per ticker: 5,000-path × 5-day Monte Carlo from current price,
                       current filtered regime distribution, sorted params, decayed news
                       → one row in gold.forecast_runs.
-7. sync_news_index  — trigger AI Search index sync (reads Delta CDF of news_articles).
+7. sync_news_index  — trigger AI Search index sync (reads Delta CDF; as built the index is
+                      over silver.news_recent, not news_articles — see C-1).
 
 AS BUILT (C-6) THE JOB HAS NINE TASKS, not these seven. Two were added — refresh_news_recent
 (after build_features) and sync_lakebase_history (after sync_news_index) — plus an optional
@@ -342,7 +343,9 @@ an article that exists — a silent retrieval hole rather than a visible error. 
 across re-runs, because both inputs are the MERGE key. The MERGE key itself is UNCHANGED.
 
 Accepted cost: the embedding is computed per ROW, so a 3-ticker article embeds 3 times. That is
-already the shape of the insights explode, and at roughly 28k rows it is bounded and small.
+already the shape of the insights explode. It is also bounded twice over, because what is indexed
+is not this table but the 90-day window derived from it (see C-1): the archive grows forever, the
+indexed corpus does not.
 
 Migration, since the table was already populated when the column was added: CREATE TABLE IF NOT
 EXISTS does not alter an existing table, so setup/create_delta_tables.sql carries an ALTER TABLE
@@ -555,9 +558,27 @@ embedding_text (managed embeddings), sync mode TRIGGERED. sync_news_index task i
 workflow triggers it. Query path: hybrid search, filter by ticker, top_k≈5.
 
 Decisions taken where the above is silent (C-1 implementation):
+- THE SOURCE TABLE IS silver.news_recent, NOT silver.news_articles — changed after C-6, when the
+  rolling window got a table of its own. Indexing the archive means embedding every article ever
+  ingested and holding those vectors forever, with nothing that ever prunes them; indexing the
+  window means the index INHERITS ITS RETENTION, because a row that ages out is deleted there and
+  the next sync drops it here. It also collapses two corpora into one, so the agent cannot cite a
+  headline the Market Research page is unable to show. The cost is that news older than
+  news_recent.window_days is not retrievable at all, which is the right trade for a system whose
+  news signal has a 2-day half-life, and widening it is a config change plus a backfill rather
+  than a code change.
+  Two things followed. silver.news_recent carries doc_id and embedding_text, which the page never
+  displays and the index cannot work without, and it is created with CDF on — being a cache, the
+  repair when it is not is DROP TABLE plus a refresh, which is not true of any other table here.
+  And refresh_news_recent had to stop rewriting unchanged rows: WHEN MATCHED THEN UPDATE SET *
+  rewrites every matched row whether or not a value moved, every rewrite is a CDF event, and every
+  CDF event is an embedding call — so the naive daily refresh would re-embed the whole window every
+  night. src/pipelines/news_recent.py anti-joins the target on all columns (null-safe <=>, so a
+  NULL publisher does not fail its own comparison) and presents only what is new or actually
+  different. The window's ledger row therefore counts changes, not window size.
 - PRIMARY KEY is the derived doc_id (article_id:ticker), not article_id. An index takes one key
-  column and this table has a composite grain; see the A-3 note for the retrieval hole that
-  article_id would open and the migration the new column needed.
+  column and both news_articles and the window derived from it have a composite grain; see the A-3
+  note for the retrieval hole that article_id would open and the migration the new column needed.
 - IDEMPOTENT BY ASKING FIRST. ensure_endpoint and ensure_index look the resource up and return
   the existing one untouched, catching ResourceAlreadyExists for the overlapping-run case. The
   index is NEVER re-created: dropping a populated one discards every embedding and re-embeds the
@@ -566,8 +587,10 @@ Decisions taken where the above is silent (C-1 implementation):
 - columns_to_sync is explicit rather than "all columns": it is exactly what search_market_news
   returns, so description and sentiment_reasoning (both long) stay out of the index and the
   snippet is cut from embedding_text, which already begins with the title. test_ai_search.py
-  asserts every synced column exists in the silver projection, because a typo here fails at sync
-  time in the workspace rather than at edit time.
+  asserts every synced column exists in the source table THE SHIPPED CONFIG NAMES, parsed out of
+  the DDL rather than out of a fixture — a fixture cannot drift into production, and both a typo'd
+  column and a source table missing doc_id fail at sync time in the workspace rather than at edit
+  time. The same test asserts CDF is on for that table.
 - wait_until_ready is hand-rolled with a deadline: the SDK ships a waiter for the endpoint but
   not for the index, and a wait with no deadline is how a notebook hangs overnight. Readiness is
   the property that matters — an index that exists but is not ready errors on query rather than
@@ -785,6 +808,11 @@ Decisions taken where the above is silent (C-6 implementation):
   step later: ingestion already resolved seed-plus-watchlist, and a ticker with no data cannot be
   fitted anyway. A gbm fallback writes a forecast and NO regime row — Model A has no regimes, and a
   row of zeros would be a lie the page would render.
+- refresh_news_recent maintains the AI SEARCH CORPUS as well as the app's news list, since C-1's
+  index is built on that table. Hence its position before sync_news_index in the chain, and hence
+  the anti-join described in C-1: a task that rewrites unchanged rows is a task that pays to
+  re-embed them. The optional backfill runs LAST, after the sync, so a batch of old articles
+  reaches the index on the next day's run instead of extending tonight's critical path.
 - news_recent's two tasks share one rule, retention_floor(), because they otherwise fight: the
   daily refresh deletes everything older than 90 days, which is exactly what the backfill adds. The
   floor is today - window_days normally and backfill_floor when news_recent.include_backfill is on.
@@ -889,7 +917,13 @@ Ticker-filtered news search finds nothing for a multi-ticker article → doc_id 
 Every workflow task fails with "notebook not found" → workflow.notebook_path points at a Git folder
   path that does not exist in this workspace. Re-run setup/create_workflow.py after fixing it.
 The app's news list is empty while the agent finds articles → refresh_news_recent has not run;
-  silver.news_recent is a materialized window, not a view over silver.news_articles.
+  silver.news_recent is a materialized window, not a view over silver.news_articles. (The reverse —
+  the page lists articles the agent cannot find — is a stale index: trigger sync_news_index.)
+The agent cannot find an article it found last quarter → it aged out of silver.news_recent, which
+  is the indexed corpus. Widen news_recent.window_days and backfill; there is no code change.
+Every sync leaves the index resyncing for minutes and the embedding bill climbs → the refresh is
+  rewriting unchanged rows. news_recent.unchanged_predicate is what prevents that; a MERGE without
+  it re-embeds the whole window nightly.
 sync_lakebase_history fails with "no suitable driver" or a connection timeout → job-side JDBC to
   Lakebase is blocked in this workspace. The app-side alternative is documented in C-6 and in
   src/pipelines/lakebase_history.py; the transport is one injected function.

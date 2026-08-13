@@ -144,9 +144,55 @@ class TestNewsRecentSql:
     def test_the_refresh_query_has_a_lower_bound_and_no_upper_one(self):
         sql = nr.source_sql("market_intel", date(2026, 5, 14))
 
-        assert "published_at >= DATE '2026-05-14'" in sql
-        assert "<" not in sql
+        assert "a.published_at >= DATE '2026-05-14'" in sql
+        assert "published_at < DATE" not in sql
         assert "FROM market_intel.silver.news_articles" in sql
+
+    def test_rows_the_window_already_holds_unchanged_are_not_re_presented(self):
+        """Otherwise every night's MERGE rewrites the whole window.
+
+        A rewritten row is a Change Data Feed event, the AI Search index (C-1) is built on this
+        table, and a feed event is an embedding call — so the naive refresh re-embeds thousands of
+        unchanged articles daily.
+        """
+        sql = nr.source_sql("market_intel", date(2026, 5, 14))
+
+        assert "NOT EXISTS (SELECT 1 FROM market_intel.silver.news_recent AS held" in sql
+        assert "held.`article_id` = a.`article_id`" in sql
+        assert "held.`ticker` = a.`ticker`" in sql
+
+    def test_the_anti_join_does_not_shadow_the_merge_target_alias(self):
+        # merge_sql wraps this text in `MERGE INTO ... AS t USING (<source>) AS s`.
+        assert " AS t\n" not in nr.source_sql("market_intel", date(2026, 5, 14))
+
+    def test_a_row_that_did_change_still_gets_through(self):
+        """Every non-key column is compared, not just the embedding source.
+
+        Skipping only on the embedding text would freeze a corrected sentiment label in the app's
+        news list forever, since nothing else ever rewrites this table.
+        """
+        predicate = nr.unchanged_predicate("market_intel")
+
+        for column in nr.COLUMNS:
+            if column in nr.MERGE_KEYS:
+                continue
+            assert f"held.`{column}` <=> a.`{column}`" in predicate, f"{column} is not compared"
+
+    def test_the_comparison_is_null_safe(self):
+        """`=` on two NULLs is NULL, not true.
+
+        With a plain `=`, an article whose publisher is NULL — the vendor sends those — would fail
+        its own comparison and be re-presented every night forever, which is exactly the churn the
+        predicate exists to stop.
+        """
+        predicate = nr.unchanged_predicate("market_intel")
+        # One comparison per line, except the key join, which is the WHERE line.
+        comparisons = [
+            line for line in predicate.splitlines() if line.strip().startswith("AND held.")
+        ]
+
+        assert comparisons, "no column comparisons at all"
+        assert all("<=>" in line for line in comparisons)
 
     def test_a_backfill_batch_is_bounded_at_both_ends(self):
         sql = nr.source_sql("market_intel", date(2026, 2, 13), date(2026, 5, 14))

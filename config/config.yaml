@@ -61,8 +61,17 @@ search:
   # prefix, so pointing the whole project at a different catalog stays a one-line change.
   endpoint_name: market-intel-search
   index: silver.news_index
-  source_table: silver.news_articles
-  # The single unique key an AI Search index requires. silver.news_articles is grained on
+  # THE ROLLING WINDOW, NOT THE ARCHIVE. This was silver.news_articles until C-6 gave the window a
+  # table of its own. Indexing the archive means embedding every article ever ingested and keeping
+  # those vectors forever; indexing the window means the index tracks it — a row that ages out is
+  # DELETED there and the next sync drops it from the index, so the corpus stays bounded without
+  # anyone pruning it. It also makes the agent's search and the Market Research news list the same
+  # set of articles, so the agent cannot cite a headline the page cannot show.
+  # THE COST: no news older than news_recent.window_days is retrievable. Deliberate — the forecast
+  # conditions on a 2-day half-life signal, and an article from last spring is not evidence about
+  # today's regime. Widening it is news_recent.window_days plus a backfill, not a code change.
+  source_table: silver.news_recent
+  # The single unique key an AI Search index requires. news_recent is grained on
   # (article_id, ticker), so this is the derived doc_id column, not article_id (C-1).
   primary_key: doc_id
   # Managed embeddings: Databricks computes the vectors from embedding_text at sync time, so

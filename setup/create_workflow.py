@@ -111,7 +111,7 @@ TASKS: tuple[WorkflowTask, ...] = (
     WorkflowTask(
         key="refresh_news_recent",
         depends_on=("build_features",),
-        description="Republish the rolling news window the app reads; trim what fell out of it.",
+        description="Republish the rolling news window the app reads and the index covers; trim what fell out of it.",
     ),
     WorkflowTask(
         key="fit_models",
@@ -121,7 +121,7 @@ TASKS: tuple[WorkflowTask, ...] = (
     WorkflowTask(
         key="sync_news_index",
         depends_on=("fit_models",),
-        description="Trigger the AI Search Delta Sync index over silver.news_articles.",
+        description="Trigger the AI Search Delta Sync index over silver.news_recent, after the window moved.",
     ),
     WorkflowTask(
         key="sync_lakebase_history",
@@ -131,6 +131,9 @@ TASKS: tuple[WorkflowTask, ...] = (
     WorkflowTask(
         key=BACKFILL_TASK,
         depends_on=("sync_lakebase_history",),
+        # Last, so its rows reach the index on the NEXT day's sync rather than this one's. Running
+        # it before sync_news_index would embed a batch of old articles inside the daily critical
+        # path, and nothing about a backfilled article is urgent.
         description="Optional: extend the news_recent window one batch further back.",
         optional=True,
     ),

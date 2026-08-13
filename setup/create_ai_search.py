@@ -3,17 +3,27 @@
 Creates:
 
 - One vector search endpoint, STANDARD tier.
-- A Delta Sync index ``market_intel.silver.news_index`` over ``silver.news_articles``, with
+- A Delta Sync index ``market_intel.silver.news_index`` over ``silver.news_recent``, with
   ``embedding_text`` as the embedding source column (managed embeddings), sync mode
   TRIGGERED.
 
-The ``sync_news_index`` workflow task triggers the sync; it runs last in the daily job.
+The ``sync_news_index`` workflow task triggers the sync, after ``refresh_news_recent`` has moved
+the window it indexes.
 
 Query path used by ``search_market_news``: hybrid search, filtered by ticker, top_k around 5.
 
-``silver.news_articles`` must have had ``delta.enableChangeDataFeed = true`` set at creation
-time, since the Delta Sync index reads the CDF. An index that is empty after a sync is this
-property missing, not a sync bug.
+THE SOURCE IS THE WINDOW, NOT THE ARCHIVE. ``search.source_table`` was ``silver.news_articles``
+until C-6 gave the rolling window a table of its own. Indexing the archive means embedding every
+article ever ingested and holding those vectors forever; indexing the window means the index
+inherits its retention, since a row that ages out is deleted there and the next sync drops it
+here. It also makes the agent's corpus and the Market Research news list the same set of articles.
+The cost is that news older than ``news_recent.window_days`` is not retrievable, which is a config
+change plus a backfill rather than a code change.
+
+The source table must have had ``delta.enableChangeDataFeed = true`` set at creation time, since
+the Delta Sync index reads the CDF. An index that is empty after a sync is this property missing,
+not a sync bug. ``silver.news_recent`` is a cache, so the repair is DROP TABLE and re-run
+``refresh_news_recent``.
 
 Financial news text is the project's required unstructured-data path. Retrieval supplies
 evidence; it never generates the numerical forecast.
@@ -26,16 +36,17 @@ RUN IT FROM A NOTEBOOK::
 
 IDEMPOTENT, and in the only way that matters: it asks before it creates. Both ``ensure_``
 functions look the resource up first and return the existing one untouched, so a second run
-neither fails nor rebuilds the index — re-creating it would drop the embeddings and re-embed
-28k rows for nothing. ``ResourceAlreadyExists`` is caught as well, for the case where two runs
+neither fails nor rebuilds the index — re-creating it would drop the embeddings and re-embed the
+whole window for nothing. ``ResourceAlreadyExists`` is caught as well, for the case where two runs
 overlap.
 
-PRIMARY KEY. An AI Search index takes exactly ONE key column, and ``silver.news_articles`` is
-grained on ``(article_id, ticker)``. The key here is therefore the derived ``doc_id``
-(``article_id:ticker``, added in the silver build at C-1), not ``article_id``: keying on the
-article alone would let one row of a multi-ticker article win arbitrarily, and a ticker-filtered
-search would then answer "no relevant news" for an article that exists. The cost is that a
-3-ticker article is embedded 3 times, which is the shape of the insights explode anyway (A-3).
+PRIMARY KEY. An AI Search index takes exactly ONE key column, and the source is grained on
+``(article_id, ticker)``. The key here is therefore the derived ``doc_id``
+(``article_id:ticker``, added in the silver build at C-1 and carried into the window), not
+``article_id``: keying on the article alone would let one row of a multi-ticker article win
+arbitrarily, and a ticker-filtered search would then answer "no relevant news" for an article that
+exists. The cost is that a 3-ticker article is embedded 3 times, which is the shape of the
+insights explode anyway (A-3).
 
 SDK SURFACE, verified against the installed databricks-sdk 0.125.0 rather than recalled:
 ``w.vector_search_endpoints`` has ``get_endpoint(endpoint_name)`` / ``create_endpoint(name,
@@ -80,8 +91,8 @@ __all__ = [
 
 #: Columns carried into the index. The primary key and the embedding source column are always
 #: synced whatever this says; the rest is exactly what ``search_market_news`` returns, and no
-#: more — ``description`` and ``sentiment_reasoning`` are long, and the snippet comes from
-#: ``embedding_text`` (which already begins with the title).
+#: more. Every name here must exist in ``search.source_table``; tests/test_ai_search.py asserts
+#: that against the source table the SHIPPED config names, parsed out of the DDL.
 SYNCED_COLUMNS = (
     "doc_id",
     "article_id",
