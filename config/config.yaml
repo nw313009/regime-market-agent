@@ -75,6 +75,61 @@ search:
   # and a long list invites hand-waving over specifics.
   top_k: 5
 
+news_recent:
+  # Added at C-5/C-6 for silver.news_recent, the rolling window the Market Research page reads.
+  # The daily refresh MERGEs this many days of news_articles and deletes what falls out of the
+  # window — the page's "recent news" list is exactly this long.
+  window_days: 90
+  # How much older history one optional backfill_news_recent run adds. The task is progressive so
+  # a demo can deepen the window without a single run rewriting the whole archive.
+  batch_days: 90
+  # The oldest published_at news_recent will ever hold. Matches massive.backfill_start_date: there
+  # is no news before it to find, so the backfill stops there rather than looping forever.
+  backfill_floor: "2024-08-01"
+  # ONE FLAG, TWO READERS, so they cannot disagree. setup/create_workflow.py adds the optional
+  # backfill_news_recent task only when this is true, and refresh_news_recent stops deleting below
+  # backfill_floor only when this is true. Split across two keys, one operator flipping one of them
+  # would build a job whose refresh deletes exactly what its backfill just added.
+  include_backfill: false
+
+lakebase:
+  # Added at C-6 for sync_lakebase_history, which reaches Postgres over Spark JDBC.
+  #
+  # THESE ARE NOT SECRETS and none of them may become one. The password is an OAuth token minted
+  # per run through databricks-sdk (w.postgres.generate_database_credential), never stored.
+  #
+  # The job cannot import src/database/lakebase.py to get these — that module imports psycopg,
+  # which SIGABRTs a serverless kernel (see requirements-databricks.txt) — so the connection facts
+  # live here, where a job and the app can both read them without sharing a driver.
+  # TODO: fill host and user from the Lakebase project before the first workflow run; the app
+  # takes the same values from app.yaml env vars, which override these.
+  host: ""
+  port: 5432
+  database: databricks_postgres
+  user: ""
+  schema: market_system
+  endpoint: projects/regime-market-database/branches/production/endpoints/primary
+
+workflow:
+  # Added at C-6. setup/create_workflow.py reads these; nothing else does.
+  job_name: regime-market-daily
+  # Quartz, not cron: Databricks schedules take a Quartz expression with a seconds field.
+  # 22:30 UTC daily, after the US close (spec A1).
+  schedule_quartz: "0 30 22 * * ?"
+  timezone: UTC
+  # Created PAUSED. A job that starts scheduling itself the moment it is defined will fire against
+  # a half-configured workspace overnight; unpausing is a deliberate act.
+  paused: true
+  # Workspace path of the thin dispatcher notebook, without the .py suffix. In a Git folder this is
+  # /Workspace/Repos/<user>/<repo>/notebooks/20_daily_run.
+  # TODO: set this to the Git folder path in the target workspace.
+  notebook_path: /Workspace/Repos/REPLACE_ME/regime-market-agent/notebooks/20_daily_run
+  # Retries on the ingestion tasks only (spec C-6): those are the ones that fail for transient
+  # network reasons, and a retried MLE fit fails the same way twice.
+  ingestion_retries: 2
+  # Whether the optional backfill_news_recent task is part of the job is news_recent.include_backfill
+  # above, not a second key here — see the note there.
+
 telemetry:
   # Added at C-3; the B0 key list predates the telemetry destination question. Where
   # src/llm/telemetry.py sends the one record it appends per model call:

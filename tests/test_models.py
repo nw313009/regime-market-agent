@@ -57,6 +57,7 @@ from src.models.backtest import (
     fit_arm,
     origin_window,
     pooled_summary,
+    production_window,
     run_backtest,
     score_forecast,
     weekly_origins,
@@ -765,6 +766,63 @@ def test_origin_window_refuses_an_origin_without_an_outcome(backtest_frame):
 def test_origin_window_refuses_a_date_that_is_not_a_session(backtest_frame):
     with pytest.raises(ValueError, match="not a session"):
         origin_window(backtest_frame, date(1999, 1, 4), horizon_days=5)
+
+
+def test_production_window_sits_at_the_last_session(backtest_frame):
+    """The daily fit forecasts from TODAY (spec A1 step 5), not from the last scorable origin."""
+    dates = feature_dates(backtest_frame)
+
+    window = production_window(backtest_frame, dates=dates)
+
+    assert window.origin == dates[-1]
+    assert window.current_price == pytest.approx(backtest_frame["close"].iloc[-1])
+    assert window.current_news == pytest.approx(backtest_frame["news_sentiment_3d"].iloc[-1])
+
+
+def test_production_window_has_no_realized_return(backtest_frame):
+    """There is no outcome yet, and NaN is how that says so — a 0.0 would score as a flat week."""
+    import math
+
+    assert math.isnan(production_window(backtest_frame).realized_return)
+
+
+def test_production_window_is_the_same_construction_as_an_origin(backtest_frame):
+    """One window builder, so production cannot drift from what the backtest validated.
+
+    The last session is not a scorable origin, so the comparison is made at a date that is both:
+    the two paths must produce identical training data there.
+    """
+    dates = feature_dates(backtest_frame)
+    truncated = backtest_frame.iloc[:101]
+
+    live = production_window(truncated)
+    scored = origin_window(backtest_frame, dates[100], dates=dates, horizon_days=5)
+
+    assert live.origin == scored.origin
+    assert live.returns_pct == pytest.approx(scored.returns_pct)
+    assert live.news == pytest.approx(scored.news)
+    assert live.current_price == pytest.approx(scored.current_price)
+
+
+def test_production_window_refuses_an_empty_frame(backtest_frame):
+    with pytest.raises(ValueError, match="empty"):
+        production_window(backtest_frame.iloc[:0])
+
+
+def test_the_ladder_carries_the_sorted_parameters_it_fitted(single_window, backtest_cfg):
+    """``fit_models`` writes gold.regime_states from the SAME fit that produced the forecast."""
+    fit = fit_arm("markov", single_window, backtest_cfg, min_obs=90)
+
+    assert fit is not None
+    assert fit.sorted_params is not None
+    assert fit.sorted_params.prob_high_vol == pytest.approx(fit.summary.prob_high_vol)
+
+
+def test_gbm_has_no_sorted_parameters_to_carry(single_window, backtest_cfg):
+    fit = fit_arm("gbm", single_window, backtest_cfg, min_obs=90)
+
+    assert fit is not None
+    assert fit.sorted_params is None
 
 
 # ----------------------------------------------------------------------- the ladder

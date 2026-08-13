@@ -44,6 +44,12 @@ Scheduled once daily after US market close (suggest 22:30 UTC), plus manual "Run
                       → one row in gold.forecast_runs.
 7. sync_news_index  — trigger AI Search index sync (reads Delta CDF of news_articles).
 
+AS BUILT (C-6) THE JOB HAS NINE TASKS, not these seven. Two were added — refresh_news_recent
+(after build_features) and sync_lakebase_history (after sync_news_index) — plus an optional
+backfill_news_recent, and steps 5 and 6 are ONE task: the forecast is simulated from the fitted
+parameters, so splitting them would mean refitting. The reasoning is in C-6; the order above is
+otherwise unchanged.
+
 The walk-forward backtest is NOT part of the daily job. It is a separate job/notebook
 run on demand; results land in gold.backtest_metrics and the app reads them.
 
@@ -97,16 +103,19 @@ regime-market-agent/
 ├── app/                    # Streamlit Databricks App
 │   ├── app.py
 │   ├── app.yaml
+│   ├── common.py           # added at C-5 — see the note below
 │   ├── requirements.txt    # app-only deps, consumed by the Databricks App
 │   └── pages/ market_research.py | research_agent.py | model_evaluation.py
 ├── src/
 │   ├── ingestion/  massive_client.py | ingest_prices.py | ingest_news.py
-│   ├── pipelines/  silver_prices.py | silver_news.py | feature_pipeline.py
+│   ├── pipelines/  silver_prices.py | silver_news.py | feature_pipeline.py |
+│   │               fit_models.py | news_recent.py | lakebase_history.py   # added at C-6
 │   ├── models/     gbm.py | markov.py | news_markov.py | monte_carlo.py | backtest.py
 │   ├── agent/      agent.py | tools.py | prompts.py
 │   ├── llm/        call_model.py | telemetry.py
 │   └── database/   delta.py | lakebase.py
-├── notebooks/      00_smoke_test.py | 10_backtest_run.py   # thin wrappers only
+├── notebooks/      00_smoke_test.py | 10_backtest_run.py |
+│                   20_daily_run.py   # added at C-6   — thin wrappers only
 ├── setup/          create_catalog.sql | create_delta_tables.sql |
 │                   create_lakebase.sql | create_ai_search.py |
 │                   create_workflow.py | seed_demo_data.py
@@ -124,7 +133,8 @@ regime-market-agent/
 │                   test_massive_client.py | test_ingestion.py | test_silver.py |
 │                   test_call_model.py | test_telemetry.py | test_lakebase.py |
 │                   test_agent_loop.py | test_ai_search.py |
-│                   test_import_boundaries.py | conftest.py
+│                   test_import_boundaries.py | test_app_pages.py |
+│                   test_workflow.py | test_daily_tasks.py | conftest.py
 │                   # test_massive_client/test_ingestion/test_silver/conftest added at A-1/A-2/A-3:
 │                   # the vendor client, the ingestion watermark/row-building logic and the silver
 │                   # derivations had no home in the original list, and conftest.py holds the
@@ -137,6 +147,10 @@ regime-market-agent/
 │                   # properties an integration test cannot demonstrate cheaply (you would have to
 │                   # provoke a runaway model and re-create a populated index), and the psycopg
 │                   # import boundary is a static property of the source tree, not of a run.
+│                   # test_app_pages/test_workflow/test_daily_tasks added at C-5/C-6: the pages'
+│                   # pure logic (the verdict line above all) and the job's task graph are both
+│                   # things that would otherwise only be checked by looking at a screen or by
+│                   # waiting for 22:30 UTC.
 ├── config/config.yaml
 ├── requirements.txt              # local 3.12 venv, fully pinned (dev + pytest)
 └── requirements-databricks.txt   # ONLY packages the Databricks runtime lacks:
@@ -191,7 +205,29 @@ massive.backfill_start_date="2024-08-01", tickers.seed[5],
 forecast.horizon_days=5, forecast.n_paths=5000, forecast.seed=42,
 news.half_life_days=2, backtest.min_train_days=252, backtest.origin_freq=weekly,
 backtest.n_weeks=26, model.agent_endpoint, model.slm_endpoint (unused until stretch),
-catalog=market_intel, telemetry.mode (added at C-3), search.* (added at C-1).
+catalog=market_intel, telemetry.mode (added at C-3), search.* (added at C-1),
+news_recent.* and lakebase.* and workflow.* (added at C-6).
+
+news_recent.* (window_days=90, batch_days=90, backfill_floor="2024-08-01",
+include_backfill=false) describes silver.news_recent, the rolling window the Market Research page
+reads. include_backfill IS ONE KEY WITH TWO READERS on purpose: setup/create_workflow.py adds the
+optional backfill task only when it is true, and refresh_news_recent stops deleting below
+backfill_floor only when it is true. As two keys, an operator flipping one of them builds a job
+whose nightly refresh deletes exactly what its backfill just added — a bug that costs a warehouse
+every night and presents as "the news window never gets longer".
+
+lakebase.* (host, port, database, user, schema, endpoint) is the non-secret half of the Lakebase
+connection, read by src/pipelines/lakebase_history.py. The job cannot import
+src/database/lakebase.py to get these — that module imports psycopg — so four strings are
+duplicated rather than shared. Environment variables (PGHOST / PGUSER / LAKEBASE_ENDPOINT) override
+them, which is how the deployed job gets workspace-specific values without a commit. There is no
+password key and there must never be one: the credential is minted per run.
+
+workflow.* (job_name, schedule_quartz="0 30 22 * * ?", timezone=UTC, paused=true,
+notebook_path, ingestion_retries=2) is read only by setup/create_workflow.py. notebook_path ships
+as a REPLACE_ME and the script refuses to run with it unset, because it is the one value that
+cannot have a sensible default and its failure mode is a job whose every task reports "notebook not
+found" at 22:30 UTC.
 
 search.* was added at C-1 because the original key list names the index but not the knobs around
 it: search.endpoint_name, search.index, search.source_table, search.primary_key,
@@ -689,9 +725,101 @@ psycopg v3 pool from C-2 (db.py wrapped by src/database/lakebase.py). Page data 
 app.yaml declares env (warehouse id, catalog, Lakebase conn). Cache reads with
 st.cache_data(ttl=600).
 
+Decisions taken where the above is silent (C-5 implementation):
+- RENDERING SITS BEHIND `if __name__ == "__main__": render()`. Streamlit execs a page under the
+  module name __main__, so the guard fires in the app AND keeps `import app.pages.x` free of side
+  effects. That is what makes the page logic testable at all: test_app_pages.py imports every page
+  and asserts, by walking the AST, that no top-level statement calls st.* or render(). A smoke
+  import would not catch a page that renders at import time — Streamlit calls outside a script run
+  only warn — so the absence is proved statically rather than observed.
+- app/common.py holds ONLY what would otherwise be copied four times: the sys.path bootstrap
+  (Streamlit puts app/ on the path, not the repo root, exactly like the notebook problem in C-a),
+  config access, number formatting, and the two disclosure sentences. Queries deliberately stay in
+  the page that uses them, so the SQL sits next to the card it fills.
+- The Market Research news list reads silver.news_recent, NOT silver.news_articles. The page
+  re-queries on every rerun over a serverless warehouse, and news_articles grows without bound and
+  carries two long text columns nobody displays. C-6 owns keeping that window fresh.
+- THE VERDICT LINE has three cases and the boring one is first-class: |spread| <= threshold reads
+  "No meaningful improvement detected at this sample size". The threshold is the spec's
+  sqrt(0.25 * 0.75 / n) heuristic and the page SAYS it is a heuristic — it is not a paired test, it
+  ignores that the arms share origins, and calling it significance would be the overclaim the whole
+  page exists to avoid. A "better" verdict whose fallback rate exceeds 25% carries the caveat that
+  most of those rows were produced by a lower rung.
+- Both writes on the agent page (watchlist buttons, save-report) go THROUGH THE TOOLS rather than
+  around them to lakebase.py, so there is one code path into Postgres and one place a ticker is
+  validated. The saved report's forecast_id is read out of the turn's own tool RESULT, so a report
+  references the forecast it actually quoted even if the daily job has since written a newer one.
+- A Lakebase outage costs the watchlist, not the page: the sidebar and the ticker selector fall
+  back to the seed universe and show the hint from C-e. A warehouse failure is fatal to a page and
+  renders the "check app.yaml, not your code" hint instead of a traceback.
+
 ### C-6 Workflow
 setup/create_workflow.py: 7 tasks in the A1 order, daily schedule, retries=2 on
 ingestion tasks, sync_news_index last.
+
+Decisions taken where the above is silent (C-6 implementation):
+- NINE TASKS, NOT SEVEN, and fit_models absorbed run_forecasts. The additions are
+  refresh_news_recent (feeds the app's news list), sync_lakebase_history (the A3 CDC direction) and
+  the optional backfill_news_recent. The merge is the notable change: A1 lists fit_models and
+  run_forecasts separately, but the forecast is simulated FROM the fitted parameters, so splitting
+  them across tasks means either refitting — two MLE runs whose optimizer paths can land in
+  different local optima, leaving gold.regime_states describing a different model than
+  gold.forecast_runs — or serializing a statsmodels result between tasks. One task writes both
+  tables and leaves one ledger row, which is what write_gold is built for.
+- ONE DISPATCHER NOTEBOOK, ONE task PARAMETER. Every task runs notebooks/20_daily_run.py with a
+  different `task` value. A spark_python_task per module puts the repo root on sys.path nowhere, so
+  `src.*` imports would resolve only by accident of the working directory; the notebook does it
+  once, the way 10_backtest_run.py does. Dependencies come from that notebook's %pip cell, not from
+  a JobEnvironment: the installed SDK documents compute.Environment as the environment for
+  NON-notebook tasks. No compute is declared at all, which is what makes the tasks serverless.
+- A STRICT CHAIN, including edges that are not data dependencies. ingest_news does not need
+  ingest_prices, and refresh_news_recent's real dependency is build_silver. They are chained
+  because the two ingestion tasks share one 5-requests-per-minute vendor budget, and because the
+  rest is minutes of work on tiny tables where a run history that reads top to bottom is worth more
+  than the wall clock. max_concurrent_runs=1 for the same reason a MERGE is a MERGE.
+- CREATE OR RESET, NEVER UPDATE. jobs.update merges task arrays by task_key, so a task removed from
+  the file — turning the optional backfill back off — would survive in the workspace forever.
+  reset overwrites, which makes create_workflow.py the definition. The job is created PAUSED.
+- fit_models takes its universe from SELECT DISTINCT ticker in silver.daily_features, not from the
+  watchlist. It cannot read the watchlist (psycopg), and the feature table gives the same answer one
+  step later: ingestion already resolved seed-plus-watchlist, and a ticker with no data cannot be
+  fitted anyway. A gbm fallback writes a forecast and NO regime row — Model A has no regimes, and a
+  row of zeros would be a lie the page would render.
+- news_recent's two tasks share one rule, retention_floor(), because they otherwise fight: the
+  daily refresh deletes everything older than 90 days, which is exactly what the backfill adds. The
+  floor is today - window_days normally and backfill_floor when news_recent.include_backfill is on.
+  The backfill reads its cursor from MIN(published_at) in the table rather than from a stored
+  watermark row — a cursor and the rows it describes are two things that can disagree, and the fix
+  for that disagreement is to recompute the cursor from the data.
+- sync_lakebase_history reaches Postgres over SPARK JDBC, feasibility verified against the installed
+  databricks-sdk 0.125.0 rather than recalled: w.postgres.generate_database_credential(endpoint=...)
+  returns a DatabaseCredential.token usable as a password over a plain HTTPS call that imports no
+  Postgres driver, and the SDK offers NO Spark integration for Postgres (PostgresAPI manages
+  infrastructure and mints credentials; its own docstring points at direct SQL connections for
+  data). So the read is spark.read.format("jdbc") with the driver Databricks Runtime ships,
+  sslmode=require, and the minted token as the password. Nothing is stored.
+  THE APP-SIDE ALTERNATIVE, if JDBC is blocked by workspace egress rules or a missing driver: the
+  transport is the injected `read` callable and everything after it — the watermark read, the row
+  shaping, the MERGE — takes plain dicts, so the swap is one function. The app-side version reads
+  the two tables through src/database/lakebase.py (psycopg works in the app container, where it is
+  proven) and writes through src/database/delta.py over the SQL warehouse, which executes a MERGE
+  as happily as a SELECT; it would run on the app's startup path or behind a button on the agent
+  page, which costs the daily cadence and keeps the capability. It is deliberately NOT implemented
+  as a second live path: two syncs writing the same two tables on different schedules is a worse
+  failure than one sync that has to be triggered by hand.
+  The watermark is each TARGET's own MAX(added_at / created_at), compared with >= so a second row
+  sharing the boundary timestamp cannot be skipped forever, and the write is a MERGE on the source
+  primary key so re-reading the boundary updates in place. A DELETE in Postgres removes nothing from
+  the history tables — "AMD was on the watchlist" stays true after AMD is removed, and the app reads
+  Lakebase when it wants the current list.
+- Three tables were added to setup/create_delta_tables.sql for the above: silver.news_recent,
+  gold.lb_watchlist_tickers_history and gold.lb_research_reports_history. The last two are named in
+  A3 but had never been declared.
+- src/models/backtest.py gained production_window() and ArmFit.sorted_params, both additive. The
+  daily fit needs a window at the LAST session (no outcome, realized_return = NaN) and the regime
+  parameters that produced the forecast. Putting a second window builder in the Spark layer would
+  be a second definition of "the training window", which is where a leak gets in on the production
+  side without a single backtest test noticing.
 
 ### C-7 Checkpoint C tests
 test_agent_tools — each write tool call produces the expected Lakebase row
@@ -758,5 +886,14 @@ Notebook kernel dies, exit 134, no traceback → something imported psycopg on s
   SIGABRTs in libpq at import; Lakebase is app-container-only (see the B0 environment note).
 Ticker-filtered news search finds nothing for a multi-ticker article → doc_id is NULL or the
   index is keyed on article_id; re-run build_silver_news, then trigger a sync.
+Every workflow task fails with "notebook not found" → workflow.notebook_path points at a Git folder
+  path that does not exist in this workspace. Re-run setup/create_workflow.py after fixing it.
+The app's news list is empty while the agent finds articles → refresh_news_recent has not run;
+  silver.news_recent is a materialized window, not a view over silver.news_articles.
+sync_lakebase_history fails with "no suitable driver" or a connection timeout → job-side JDBC to
+  Lakebase is blocked in this workspace. The app-side alternative is documented in C-6 and in
+  src/pipelines/lakebase_history.py; the transport is one injected function.
+The news window never gets longer despite running the backfill → news_recent.include_backfill is
+  false, so the daily refresh is deleting what the backfill adds. One key controls both.
 
 END OF SPEC. Build order within each checkpoint follows document order.

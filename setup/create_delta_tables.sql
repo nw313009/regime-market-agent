@@ -178,6 +178,33 @@ TBLPROPERTIES (delta.enableChangeDataFeed = true);
 ALTER TABLE market_intel.silver.news_articles
   ADD COLUMN IF NOT EXISTS doc_id STRING COMMENT 'DERIVED at C-1: article_id || ":" || ticker. Primary key of the AI Search index.';
 
+-- The app's news list (C-5). A MATERIALIZED ROLLING WINDOW over silver.news_articles, not a view.
+--
+-- Why it exists: the Market Research page runs its news query on every rerun, over a serverless
+-- warehouse, for a user who is watching. news_articles grows without bound and carries two long
+-- text columns the page never shows; this table holds the recent slice and only the displayed
+-- columns, so the page reads a few hundred rows instead of scanning the archive. It is a cache
+-- with an owner (the refresh_news_recent task), which is why it is a table and not a view — a
+-- view would re-scan the archive on every page load and defeat the point.
+--
+-- WINDOW SEMANTICS. refresh_news_recent MERGEs the last news_recent.window_days (90) of
+-- news_articles and deletes rows older than the retention floor. The floor is normally
+-- today - window_days, but never above what backfill_news_recent has already reached: the two
+-- tasks would otherwise fight, with the daily refresh deleting exactly what the backfill added.
+-- See src/pipelines/news_recent.py, which owns that single rule.
+CREATE TABLE IF NOT EXISTS market_intel.silver.news_recent (
+  article_id      STRING NOT NULL COMMENT 'From silver.news_articles. MERGE key 1.',
+  ticker          STRING NOT NULL COMMENT 'From silver.news_articles. MERGE key 2.',
+  published_at    TIMESTAMP       COMMENT 'Publication instant. The window column: retention and backfill are both expressed against it.',
+  title           STRING          COMMENT 'Displayed by the page and named by the agent when it cites an article.',
+  publisher       STRING          COMMENT 'Displayed next to the title, so a reader can weigh the source.',
+  sentiment_label STRING          COMMENT 'Raw vendor label, displayed as-is.',
+  sentiment_score INT             COMMENT 'The +1/0/-1 derivation, for the aggregate tone line the page shows above the list.',
+  article_url     STRING          COMMENT 'Link target for the headline.'
+)
+USING DELTA
+COMMENT 'Rolling recent-news window for the app (C-5). MERGE on (article_id, ticker) — never a blind INSERT. Derived from silver.news_articles; never written by ingestion.';
+
 -- =====================================================================================
 -- SILVER FEATURES (A-4) — implemented
 -- =====================================================================================
@@ -356,3 +383,42 @@ CREATE TABLE IF NOT EXISTS market_intel.gold.model_calls (
 )
 USING DELTA
 COMMENT 'LLM call telemetry (C-3). MERGE on (call_id) — never a blind INSERT.';
+
+-- =====================================================================================
+-- GOLD — LAKEBASE HISTORY (C-6) — implemented
+-- =====================================================================================
+-- THE CDC LANDING TABLES. Operational writes happen in Lakebase (Postgres); the
+-- sync_lakebase_history task carries them into the lakehouse. This is the demo's second data
+-- direction (spec A3) and the only place where Postgres rows become Delta rows.
+--
+-- HISTORY, NOT A MIRROR. Each row is "this is what the operational row looked like when we
+-- captured it", stamped with captured_at. The sync is watermark-based and append-only in spirit,
+-- so a DELETE in Postgres does not remove anything here — a watchlist ticker that was added and
+-- then removed stays visible in the history, which is the point of a history table. Reading these
+-- as the current watchlist would be wrong; the app reads Lakebase for that.
+--
+-- The write is still a MERGE on the source primary key (rule 4): the watermark is a >= comparison
+-- and a re-run legitimately re-reads the boundary row, which must update in place rather than
+-- duplicate. captured_at therefore records the most recent capture of a row, not the first.
+CREATE TABLE IF NOT EXISTS market_intel.gold.lb_watchlist_tickers_history (
+  watchlist_id STRING NOT NULL COMMENT 'From market_system.watchlist_tickers. MERGE key 1.',
+  ticker       STRING NOT NULL COMMENT 'From market_system.watchlist_tickers. MERGE key 2.',
+  added_at     TIMESTAMP       COMMENT 'Postgres added_at, in UTC. THE WATERMARK COLUMN: the next sync reads rows strictly newer than the maximum value here.',
+  added_by     STRING          COMMENT 'user_id that added the ticker, NULL when the Postgres row has none.',
+  captured_at  TIMESTAMP       COMMENT 'UTC wall-clock of the sync run that captured this row. Distance from added_at is the CDC lag the demo shows.'
+)
+USING DELTA
+COMMENT 'Lakebase watchlist_tickers, captured into Delta (C-6). MERGE on (watchlist_id, ticker) — never a blind INSERT.';
+
+CREATE TABLE IF NOT EXISTS market_intel.gold.lb_research_reports_history (
+  report_id   STRING NOT NULL COMMENT 'From market_system.research_reports. MERGE key.',
+  user_id     STRING          COMMENT 'Author of the report.',
+  ticker      STRING          COMMENT 'Ticker the report is about.',
+  question    STRING          COMMENT 'The question that produced the report. May be NULL.',
+  report_md   STRING          COMMENT 'Markdown body, carried verbatim.',
+  forecast_id STRING          COMMENT 'gold.forecast_runs.forecast_id the report was written against, when the agent had one. Joinable back to the forecast that the text describes.',
+  created_at  TIMESTAMP       COMMENT 'Postgres created_at, in UTC. THE WATERMARK COLUMN.',
+  captured_at TIMESTAMP       COMMENT 'UTC wall-clock of the sync run that captured this row.'
+)
+USING DELTA
+COMMENT 'Lakebase research_reports, captured into Delta (C-6). MERGE on (report_id) — never a blind INSERT.';

@@ -14,16 +14,40 @@
 command: ["streamlit", "run", "app/app.py"]
 
 env:
-  # Serverless SQL warehouse the app queries Delta through.
+  # ---------------------------------------------------------------- Delta over SQL (C-5)
+  # src/database/delta.py needs a hostname and an HTTP path. It accepts either half of each pair
+  # and prefers the explicit one, so all four names are declared here rather than relying on what
+  # the Apps runtime happens to inject:
+  #
+  #   hostname  DATABRICKS_SERVER_HOSTNAME, else DATABRICKS_HOST (scheme stripped either way)
+  #   path      DATABRICKS_HTTP_PATH,       else built from DATABRICKS_WAREHOUSE_ID
+  #
+  # DATABRICKS_HOST is injected into an app automatically; DATABRICKS_SERVER_HOSTNAME is not, and
+  # naming it here means the connection does not depend on that injection continuing to happen.
+  # Host WITHOUT the https:// prefix — the connector wants a hostname, not a URL.
+  - name: DATABRICKS_SERVER_HOSTNAME
+    value: "REPLACE_ME_workspace_host"   # e.g. dbc-1234abcd-5678.cloud.databricks.com
+
+  # Serverless SQL warehouse the app queries Delta through. The id is what an app resource
+  # binding provides; the path is derived from it as /sql/1.0/warehouses/<id>.
   - name: DATABRICKS_WAREHOUSE_ID
     value: "REPLACE_ME_warehouse_id"
+  - name: DATABRICKS_HTTP_PATH
+    value: "/sql/1.0/warehouses/REPLACE_ME_warehouse_id"
+
+  # NO DATABRICKS_TOKEN. When it is absent the connector authenticates as the app's own service
+  # principal through the SDK's credentials provider, which is the whole point of running as one.
+  # A token here would be a secret in a config file (rule 5).
 
   # Unity Catalog catalog holding bronze / silver / gold.
   - name: CATALOG
     value: "market_intel"
 
+  # ---------------------------------------------------------------- Lakebase (C-2)
   # Lakebase (Postgres) connection, read by src/database/lakebase.py through the pooled
-  # psycopg v3 pattern in db.py. There is NO password env var: each connection authenticates
+  # psycopg v3 pattern in db.py. The LAKEBASE_* names below and the PG* names used locally in
+  # .env are aliases of each other — settings_from_env accepts both, so one Lakebase project is
+  # described identically in both places. There is NO password env var: each connection authenticates
   # with a short-lived credential from w.postgres.generate_database_credential, using the app's
   # own service principal identity.
   #

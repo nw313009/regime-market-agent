@@ -89,6 +89,7 @@ __all__ = [
     "fit_arm",
     "origin_window",
     "pooled_summary",
+    "production_window",
     "run_backtest",
     "score_forecast",
     "weekly_origins",
@@ -150,6 +151,11 @@ class ArmFit:
     converged: bool | None
     #: Recorded reasons for every rung that failed above ``model_used``, or ``None``.
     failure_reason: str | None
+    #: The rung's ``SortedParams``, or ``None`` when GBM answered — it has no regimes. Carried
+    #: because the daily ``fit_models`` task (C-6) writes ``gold.regime_states`` from the SAME fit
+    #: that produced the forecast. Refitting to recover the parameters would be a second MLE with
+    #: its own optimizer path, and the two tables would then describe two different models.
+    sorted_params: Any | None = None
 
     @property
     def fell_back(self) -> bool:
@@ -326,6 +332,35 @@ def origin_window(
             "cannot be scored"
         )
 
+    return _window_at(frame, index, trade_dates, outcome_index=index + horizon_days)
+
+
+def production_window(frame: Any, *, dates: Sequence[date] | None = None) -> OriginWindow:
+    """The window at the LAST session in the frame: the daily ``fit_models`` fit (spec A1 step 5).
+
+    The same construction as :func:`origin_window` with one difference — there is no outcome, so
+    ``realized_return`` is NaN and the window must never be scored. That is the whole distinction
+    between the backtest and production: an origin is a day whose future has already happened, and
+    today is not.
+
+    It lives here, next to the window the backtest uses and the ladder that consumes it, because a
+    second implementation of "the training window" in the Spark layer is exactly how a leak or an
+    off-by-one row gets in on the production side without a single backtest test noticing.
+    """
+    trade_dates = list(dates) if dates is not None else feature_dates(frame)
+    if not trade_dates:
+        raise ValueError("cannot build a window from an empty daily_features frame")
+    return _window_at(frame, len(trade_dates) - 1, trade_dates, outcome_index=None)
+
+
+def _window_at(
+    frame: Any,
+    index: int,
+    trade_dates: Sequence[date],
+    *,
+    outcome_index: int | None,
+) -> OriginWindow:
+    """Slice the training window ending at ``index`` and read the outcome, if there is one."""
     window = frame.iloc[: index + 1]
     log_return = np.asarray(window["log_return"].tolist(), dtype=float)
     news_column = np.asarray(window["news_sentiment_3d"].tolist(), dtype=float)
@@ -335,9 +370,16 @@ def origin_window(
     # The SAME trim, from the same helper, so news cannot slide against returns by a row.
     news = news_column[warmup_offset(log_return) :]
 
+    origin = trade_dates[index]
     current_price = float(closes[index])
     if not np.isfinite(current_price) or current_price <= 0:
         raise ValueError(f"close at origin {origin} is not a usable price: {current_price}")
+
+    realized = (
+        float("nan")
+        if outcome_index is None
+        else float(closes[outcome_index] / current_price - 1.0)
+    )
 
     return OriginWindow(
         origin=origin,
@@ -345,7 +387,7 @@ def origin_window(
         news=news,
         current_price=current_price,
         current_news=float(news_column[-1]),
-        realized_return=float(closes[index + horizon_days] / current_price - 1.0),
+        realized_return=realized,
     )
 
 
@@ -371,7 +413,7 @@ def fit_arm(
     failures: list[str] = []
     for rung in LADDERS[arm]:
         try:
-            summary, converged = _forecast_rung(rung, window, cfg, min_obs=min_obs)
+            summary, converged, sorted_params = _forecast_rung(rung, window, cfg, min_obs=min_obs)
         except FitError as exc:
             failures.append(f"{rung}: {exc}")
             log.info("origin=%s arm=%s rung=%s failed: %s", window.origin, arm, rung, exc)
@@ -382,6 +424,7 @@ def fit_arm(
             summary=summary,
             converged=converged,
             failure_reason="; ".join(failures) or None,
+            sorted_params=sorted_params,
         )
 
     log.warning("origin=%s arm=%s produced no forecast: %s", window.origin, arm, "; ".join(failures))
@@ -394,13 +437,18 @@ def _forecast_rung(
     cfg: Mapping,
     *,
     min_obs: int,
-) -> tuple[ForecastSummary, bool | None]:
-    """Fit one rung on the shared window and forecast the horizon from it."""
+) -> tuple[ForecastSummary, bool | None, Any | None]:
+    """Fit one rung on the shared window and forecast the horizon from it.
+
+    Returns the forecast, the optimizer's convergence flag, and the sorted regime parameters —
+    the last of which is ``None`` for GBM and is what ``fit_models`` turns into a
+    ``gold.regime_states`` row.
+    """
     rng = rng_for(cfg)  # fresh Generator per forecast run: common random numbers across arms
 
     if rung == GBM:
         params = fit_gbm(window.returns_pct, min_obs=min_obs)
-        return run_gbm_forecast(params, window.current_price, cfg, rng), None
+        return run_gbm_forecast(params, window.current_price, cfg, rng), None, None
 
     if rung == MARKOV:
         res = fit_markov(window.returns_pct, min_obs=min_obs)
@@ -410,6 +458,7 @@ def _forecast_rung(
                 sorted_params, None, window.current_price, window.current_news, cfg, rng
             ),
             sorted_params.converged,
+            sorted_params,
         )
 
     res = fit_news_markov(window.returns_pct, window.news, min_obs=min_obs)
@@ -417,6 +466,7 @@ def _forecast_rung(
     return (
         run_forecast(sorted_params, res, window.current_price, window.current_news, cfg, rng),
         sorted_params.converged,
+        sorted_params,
     )
 
 
