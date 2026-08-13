@@ -583,6 +583,35 @@ Decisions taken where the above is silent (C-1 implementation):
   the existing one untouched, catching ResourceAlreadyExists for the overlapping-run case. The
   index is NEVER re-created: dropping a populated one discards every embedding and re-embeds the
   table. A misconfigured index has to be deleted deliberately, by hand.
+- BUT "IT EXISTS" IS NOT "IT IS RIGHT" — learned the expensive way, immediately after the source
+  table moved to news_recent. Re-running main() found the old index BY NAME, returned it
+  unexamined, synced it from news_articles and reported success. Three independent failures had to
+  line up for that to be silent, and all three are now closed:
+  (1) ensure_index compares the LIVE index against config (index_drift) and REFUSES a mismatch,
+      naming every difference and the delete call. It still never deletes: a Delta Sync source is
+      immutable, so the repair is destructive and belongs to a person, not to a re-run. Strict on
+      source table, primary key and embedding column, where "could not tell" counts as drift —
+      an index with no delta_sync_index_spec is refused, because a guard that passes on missing
+      information is a guard that is not there. Lenient on subtype, pipeline type and embedding
+      endpoint, compared only when the API returns them: a guard that cries wolf gets switched off.
+      Names are normalized for backticks and case only — both sides were already three-part, and
+      the qualification was never the bug despite being the obvious suspect.
+  (2) main's summary is READ BACK from get_index and carries matches_config. It used to echo
+      settings.source_table_fqn, so the one output that could have exposed the drift instead
+      manufactured a confirmation out of the operator's own intent.
+  (3) narrate() gives this module's INFO lines a stdout handler when nothing else has one.
+      logging.basicConfig sat under `if __name__ == "__main__"`, which never runs on the notebook
+      path, so every progress line in every notebook run had been discarded. It defers when the
+      caller has already configured logging, and cannot stack handlers on a re-run.
+  The fixture gap is the part worth remembering: FakeIndex carried a name and a status and nothing
+  else, so no test COULD express "the index points at the wrong table". The suite was not weak
+  here, it was blind. It now includes the case-only-difference negative test, so the normalization
+  cannot be tightened into false alarms later.
+- READINESS IS NOT SYNC COMPLETION. wait_until_ready returns the moment status.ready is true, and
+  an already-built index is ready the instant a sync is triggered — so on a re-run it returns
+  immediately and indexed_row_count may still be the previous number. It is the FIRST build, where
+  the index is not ready until it has embedded the source, that the wait is for. Noted at the call
+  site because "it said ready" was one of the signals that made the stale index look healthy.
 - index_subtype=HYBRID, matching the query path. The SDK documents VECTOR as unsupported.
 - columns_to_sync is explicit rather than "all columns": it is exactly what search_market_news
   returns, so description and sentiment_reasoning (both long) stay out of the index and the
@@ -921,6 +950,12 @@ The app's news list is empty while the agent finds articles → refresh_news_rec
   the page lists articles the agent cannot find — is a stale index: trigger sync_news_index.)
 The agent cannot find an article it found last quarter → it aged out of silver.news_recent, which
   is the indexed corpus. Widen news_recent.window_days and backfill; there is no code change.
+create_ai_search.main() raises "exists but does not match config" → the index was built on a
+  different source table (or key, or embedding column). That is the guard working. Verify the new
+  source table is populated FIRST, then delete_index and re-run — the source cannot be changed in
+  place, and deleting before the new table is ready buys an empty index instead of a stale one.
+create_ai_search.main() runs silently → an old copy without narrate(). Every progress line is
+  log.info, and basicConfig only ran under __main__.
 Every sync leaves the index resyncing for minutes and the embedding bill climbs → the refresh is
   rewriting unchanged rows. news_recent.unchanged_predicate is what prevents that; a MERGE without
   it re-embeds the whole window nightly.

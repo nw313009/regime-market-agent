@@ -129,10 +129,10 @@ workflow:
   # Created PAUSED. A job that starts scheduling itself the moment it is defined will fire against
   # a half-configured workspace overnight; unpausing is a deliberate act.
   paused: true
-  # Workspace path of the thin dispatcher notebook, without the .py suffix. In a Git folder this is
-  # /Workspace/Repos/<user>/<repo>/notebooks/20_daily_run.
-  # TODO: set this to the Git folder path in the target workspace.
-  notebook_path: /Workspace/Repos/REPLACE_ME/regime-market-agent/notebooks/20_daily_run
+  # Workspace path of the thin dispatcher notebook, WITHOUT the .py suffix — the Jobs API takes the
+  # notebook's workspace path, and a trailing .py is a path that does not resolve.
+  # This workspace puts Git folders under /Workspace/Users/<email>/, not /Workspace/Repos/.
+  notebook_path: /Workspace/Users/nandawritam@gmail.com/regime-market-agent/notebooks/20_daily_run
   # Retries on the ingestion tasks only (spec C-6): those are the ones that fail for transient
   # network reasons, and a retried MLE fit fails the same way twice.
   ingestion_retries: 2
