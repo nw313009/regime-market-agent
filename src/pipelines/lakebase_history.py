@@ -68,11 +68,14 @@ from src.pipelines import (
 
 __all__ = [
     "HISTORY_TABLES",
+    "SECRET_KEYS",
+    "SECRET_SCOPE",
     "TASK_NAME",
     "HistoryTable",
     "LakebaseConnection",
     "access_token",
     "connection_from_config",
+    "env_from_secrets",
     "history_rows",
     "jdbc_options",
     "main",
@@ -89,6 +92,18 @@ TASK_NAME = "sync_lakebase_history"
 #: The JDBC driver Databricks Runtime ships. Named explicitly so a missing driver fails with the
 #: class name in the message rather than as "no suitable driver found for jdbc:postgresql".
 JDBC_DRIVER = "org.postgresql.Driver"
+
+#: Where the host and the role come from when they are kept out of the repository. The scope is the
+#: one A-0 created for the Massive key; these two keys are added alongside it.
+SECRET_SCOPE = "capstone"
+
+#: secret key -> the env name it stands in for, so one mechanism reads both. A serverless notebook
+#: task cannot be given environment variables, which is what makes the secret scope the only way to
+#: supply these without committing them.
+SECRET_KEYS: Mapping[str, str] = {
+    "lakebase_host": "PGHOST",
+    "lakebase_user": "PGUSER",
+}
 
 
 @dataclass(frozen=True)
@@ -202,11 +217,51 @@ def connection_from_config(
     ]
     if missing:
         raise ValueError(
-            f"{TASK_NAME}: lakebase {', '.join(missing)} not configured. Set them in "
-            "config/config.yaml under `lakebase:` or as PGHOST / PGUSER / LAKEBASE_ENDPOINT on "
-            "the job environment."
+            f"{TASK_NAME}: lakebase {', '.join(missing)} not configured. Put them in the "
+            f"`{SECRET_SCOPE}` secret scope as "
+            f"{' / '.join(sorted(SECRET_KEYS))} (see env_from_secrets), or in "
+            "config/config.yaml under `lakebase:`, or as PGHOST / PGUSER / LAKEBASE_ENDPOINT in "
+            "the environment."
         )
     return connection
+
+
+def env_from_secrets(
+    secret_getter: Callable[[str, str], str],
+    scope: str = SECRET_SCOPE,
+    keys: Mapping[str, str] = SECRET_KEYS,
+) -> dict[str, str]:
+    """Read the connection facts from a secret scope, shaped as the ``env`` mapping above takes.
+
+    WHY A SECRET SCOPE FOR VALUES THAT ARE NOT SECRETS. The host and the Postgres role are not
+    credentials — the password is an OAuth token minted per run and never stored — but they are
+    workspace infrastructure, and this repository is public. A serverless notebook task cannot be
+    handed environment variables, so the choice is: commit them, or read them from the scope that
+    A-0 already created for the Massive key. This is that second option.
+
+    ``secret_getter`` is ``dbutils.secrets.get``, passed in rather than imported, because dbutils
+    exists only inside a workspace and this module has to stay importable and testable outside one.
+
+    A MISSING SECRET IS NOT AN ERROR HERE. It is skipped, and the value falls through to config or
+    to a real environment variable; if nothing supplies it, connection_from_config raises with a
+    message naming all three places to look. Failing in this function instead would replace that
+    complete diagnosis with "no such secret", which is only one of the three answers.
+    """
+    resolved: dict[str, str] = {}
+    for secret_key, env_name in keys.items():
+        try:
+            value = secret_getter(scope, secret_key)
+        except Exception as exc:  # noqa: BLE001 — dbutils raises workspace-specific types
+            log.info(
+                "secret %s/%s unavailable (%s); falling back to config",
+                scope,
+                secret_key,
+                type(exc).__name__,
+            )
+            continue
+        if value:
+            resolved[env_name] = str(value)
+    return resolved
 
 
 def access_token(connection: LakebaseConnection, workspace_client: Any = None) -> str:

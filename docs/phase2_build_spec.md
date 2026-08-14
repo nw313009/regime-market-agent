@@ -220,9 +220,17 @@ every night and presents as "the news window never gets longer".
 lakebase.* (host, port, database, user, schema, endpoint) is the non-secret half of the Lakebase
 connection, read by src/pipelines/lakebase_history.py. The job cannot import
 src/database/lakebase.py to get these — that module imports psycopg — so four strings are
-duplicated rather than shared. Environment variables (PGHOST / PGUSER / LAKEBASE_ENDPOINT) override
-them, which is how the deployed job gets workspace-specific values without a commit. There is no
-password key and there must never be one: the credential is minted per run.
+duplicated rather than shared. There is no password key and there must never be one: the
+credential is minted per run.
+
+host AND user SHIP EMPTY and come from the `capstone` secret scope (keys lakebase_host,
+lakebase_user), read by lakebase_history.env_from_secrets and handed in by the dispatcher
+notebook, which is the only place dbutils exists. Not because they are secrets — they are not,
+and the block says so — but because this repository is public and they are workspace
+infrastructure. The usual answer, an environment variable on the job, is unavailable: a serverless
+notebook task cannot be given one. Resolution order is environment variable, then secret, then
+this file, and a missing secret falls through rather than raising, so the error when nothing
+supplies a value still names all three places to look.
 
 workflow.* (job_name, schedule_quartz="0 30 22 * * ?", timezone=UTC, paused=true,
 notebook_path, ingestion_retries=2) is read only by setup/create_workflow.py. notebook_path ships
@@ -962,6 +970,9 @@ Every sync leaves the index resyncing for minutes and the embedding bill climbs 
 sync_lakebase_history fails with "no suitable driver" or a connection timeout → job-side JDBC to
   Lakebase is blocked in this workspace. The app-side alternative is documented in C-6 and in
   src/pipelines/lakebase_history.py; the transport is one injected function.
+sync_lakebase_history fails with "lakebase host, user not configured" → the `capstone` scope is
+  missing lakebase_host / lakebase_user. Add them with the CLI (databricks secrets put-secret);
+  they cannot be created from a notebook, and config.yaml ships them empty on purpose.
 The news window never gets longer despite running the backfill → news_recent.include_backfill is
   false, so the daily refresh is deleting what the backfill adds. One key controls both.
 

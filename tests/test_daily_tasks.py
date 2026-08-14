@@ -354,10 +354,62 @@ class TestLakebaseConnection:
         assert connection.user == "someone-else"
 
     def test_missing_settings_fail_with_the_names_to_fix(self):
-        with pytest.raises(ValueError, match="host, user"):
+        with pytest.raises(ValueError, match="host, user") as raised:
             lakebase_history.connection_from_config(
                 config(lakebase={"host": "", "user": ""}), env={}
             )
+
+        # All three places a value can come from, because the reader does not know which one the
+        # operator chose and "not configured" without a where is a scavenger hunt.
+        message = str(raised.value)
+        assert "secret scope" in message
+        assert "config.yaml" in message
+        assert "PGHOST" in message
+
+
+class TestSecretScopeFallback:
+    """Host and role come from the `capstone` scope: not secrets, but not for a public repo.
+
+    A serverless notebook task cannot be given environment variables, so a scope is the only way
+    to supply them without committing them.
+    """
+
+    def test_secrets_are_read_as_the_env_names_they_stand_in_for(self):
+        fetched = []
+
+        def getter(scope, key):
+            fetched.append((scope, key))
+            return {"lakebase_host": "real.databricks.com", "lakebase_user": "someone"}[key]
+
+        assert lakebase_history.env_from_secrets(getter) == {
+            "PGHOST": "real.databricks.com",
+            "PGUSER": "someone",
+        }
+        assert {scope for scope, _ in fetched} == {"capstone"}
+
+    def test_the_secrets_satisfy_the_connection_the_empty_config_cannot(self):
+        """End to end: what the shipped config leaves blank, the scope fills."""
+        shipped = config(lakebase={"host": "", "user": "", "endpoint": "projects/p/branches/b/endpoints/e"})
+        env = lakebase_history.env_from_secrets(
+            lambda scope, key: {"lakebase_host": "real.databricks.com", "lakebase_user": "someone"}[key]
+        )
+
+        connection = lakebase_history.connection_from_config(shipped, env=env)
+
+        assert connection.host == "real.databricks.com"
+        assert connection.user == "someone"
+
+    def test_a_missing_secret_falls_through_instead_of_raising(self):
+        """The scope is one of three sources; failing here would hide the other two."""
+
+        def getter(scope, key):
+            raise Exception(f"Secret does not exist with scope: {scope} and key: {key}")
+
+        assert lakebase_history.env_from_secrets(getter) == {}
+
+    def test_a_blank_secret_is_not_an_override(self):
+        # An empty secret must not shadow a filled-in config value with "".
+        assert lakebase_history.env_from_secrets(lambda scope, key: "") == {}
 
     def test_the_password_is_minted_and_never_stored(self):
         """The whole reason this task can exist without a secret: a per-run OAuth token."""

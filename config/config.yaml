@@ -110,8 +110,14 @@ lakebase:
   # The job cannot import src/database/lakebase.py to get these — that module imports psycopg,
   # which SIGABRTs a serverless kernel (see requirements-databricks.txt) — so the connection facts
   # live here, where a job and the app can both read them without sharing a driver.
-  # TODO: fill host and user from the Lakebase project before the first workflow run; the app
-  # takes the same values from app.yaml env vars, which override these.
+  #
+  # HOST AND USER ARE DELIBERATELY EMPTY HERE and come from the `capstone` secret scope instead,
+  # as keys `lakebase_host` and `lakebase_user`. Not because they are secrets — they are not — but
+  # because this repository is public and they are workspace infrastructure. A serverless notebook
+  # task cannot be given environment variables, so a scope is the only way to supply them without
+  # committing them; notebooks/20_daily_run.py reads them through
+  # src/pipelines/lakebase_history.env_from_secrets. Filling them in here still works and wins
+  # nothing over the scope — resolution order is env var, then secret, then this file.
   host: ""
   port: 5432
   database: databricks_postgres
