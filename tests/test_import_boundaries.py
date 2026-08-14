@@ -162,7 +162,8 @@ def test_psycopg_is_absent_from_the_cluster_requirements():
     ]
 
     assert not any(line.lower().startswith("psycopg") for line in installs), installs
-    # It stays in the local venv and in the app, which are the two places it works.
-    for path in ("requirements.txt", "app/requirements.txt"):
+    # It stays in the local venv (requirements-dev.txt) and in the app (the ROOT requirements.txt,
+    # which is the app's since its source root became the repository root) — the two places it works.
+    for path in ("requirements-dev.txt", "requirements.txt"):
         other = (REPO_ROOT / path).read_text(encoding="utf-8")
         assert re.search(r"^psycopg", other, re.M), f"{path} should still install psycopg"

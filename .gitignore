@@ -57,7 +57,7 @@ _delta_log/
 checkpoint/
 dbfs/
 
-# Streamlit local secrets — Databricks Apps supply env via app/app.yaml instead
+# Streamlit local secrets — Databricks Apps supply env via app.yaml instead
 .streamlit/secrets.toml
 
 # ---------- Secrets (spec rule 5: no secrets in code) ----------

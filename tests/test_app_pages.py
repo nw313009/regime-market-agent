@@ -31,7 +31,6 @@ from app import common
 from app.pages import market_research, model_evaluation, research_agent
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-APP_DIR = REPO_ROOT / "app"
 
 PAGE_MODULES = (
     "app.app",
@@ -371,7 +370,13 @@ class TestResearchAgentPage:
 
 @pytest.fixture(scope="module")
 def manifest() -> dict:
-    return yaml.safe_load((APP_DIR / "app.yaml").read_text(encoding="utf-8"))
+    """app.yaml at the REPOSITORY ROOT, which is where a Databricks App looks for it.
+
+    It sat in app/ until the source root question was settled: the app imports src/ and reads
+    config/config.yaml, so the deployed tree has to be the whole repository, and the manifest has
+    to be at the root of it. The root requirements.txt is the app's for the same reason.
+    """
+    return yaml.safe_load((REPO_ROOT / "app.yaml").read_text(encoding="utf-8"))
 
 
 @pytest.fixture(scope="module")
@@ -428,9 +433,16 @@ class TestAppManifest:
         forbidden = ("PASSWORD", "SECRET", "TOKEN", "PGPASSWORD")
         assert not [name for name in env if any(word in name.upper() for word in forbidden)]
 
+    def test_the_command_is_relative_to_the_repository_root(self, manifest):
+        """Which is the app's source root, and therefore where this path is resolved from."""
+        entry = manifest["command"][-1]
+
+        assert entry == "app/app.py"
+        assert (REPO_ROOT / entry).exists(), f"{entry} does not exist relative to the source root"
+
     def test_the_app_requirements_exclude_the_modelling_stack(self):
         """The app reads precomputed Gold; statsmodels in the container is a cold start for nothing."""
-        text = (APP_DIR / "requirements.txt").read_text(encoding="utf-8").lower()
+        text = (REPO_ROOT / "requirements.txt").read_text(encoding="utf-8").lower()
         installs = [
             line.strip()
             for line in text.splitlines()

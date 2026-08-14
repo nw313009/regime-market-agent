@@ -103,10 +103,11 @@ show Lakebase rows → show CDC arrival in Delta → stop.
 regime-market-agent/
 ├── app/                    # Streamlit Databricks App
 │   ├── app.py
-│   ├── app.yaml
 │   ├── common.py           # added at C-5 — see the note below
-│   ├── requirements.txt    # app-only deps, consumed by the Databricks App
 │   └── pages/ market_research.py | research_agent.py | model_evaluation.py
+│                           # app.yaml and the app's requirements.txt are NOT here: they are at
+│                           # the repository root, because that is the app's source root. See the
+│                           # dependency note below.
 ├── src/
 │   ├── ingestion/  massive_client.py | ingest_prices.py | ingest_news.py
 │   ├── pipelines/  silver_prices.py | silver_news.py | feature_pipeline.py |
@@ -153,7 +154,9 @@ regime-market-agent/
 │                   # things that would otherwise only be checked by looking at a screen or by
 │                   # waiting for 22:30 UTC.
 ├── config/config.yaml
-├── requirements.txt              # local 3.12 venv, fully pinned (dev + pytest)
+├── app.yaml                      # the Databricks App manifest — at the ROOT, see below
+├── requirements.txt              # the Databricks App's deps — at the ROOT, see below
+├── requirements-dev.txt          # local 3.12 venv, fully pinned (dev + pytest)
 └── requirements-databricks.txt   # ONLY packages the Databricks runtime lacks:
                                   # statsmodels, exchange_calendars,
                                   # databricks-sql-connector
@@ -161,22 +164,37 @@ regime-market-agent/
                                   # psycopg REMOVED at C-1 — see the environment note below
 
 Dependency environments are split three ways, recorded here under rule 2 (spec silent →
-simplest working option). requirements.txt fully pins the local Python 3.12 dev/test venv —
-statsmodels, pandas, numpy, exchange_calendars, databricks-sql-connector,
-psycopg[binary,pool], databricks-sdk, streamlit, requests, pyyaml, pytest — with
-statsmodels==0.14.6 as a hard floor, since earlier versions fail to import under pandas 3.0;
-it is never installed on a cluster. requirements-databricks.txt is what notebooks and job
-environments install, and lists only what the runtime lacks (statsmodels,
-exchange_calendars, databricks-sql-connector) plus databricks-sdk,
+simplest working option):
+
+  local venv     -> requirements-dev.txt
+  cluster        -> requirements-databricks.txt
+  Databricks App -> requirements.txt (at the repository ROOT), alongside app.yaml
+
+requirements-dev.txt fully pins the local Python 3.12 dev/test venv — statsmodels, pandas,
+numpy, exchange_calendars, databricks-sql-connector, psycopg[binary,pool], databricks-sdk,
+streamlit, requests, pyyaml, pytest — with statsmodels==0.14.6 as a hard floor, since earlier
+versions fail to import under pandas 3.0; it is never installed on a cluster.
+requirements-databricks.txt is what notebooks and job environments install, and lists only what
+the runtime lacks (statsmodels, exchange_calendars, databricks-sql-connector) plus databricks-sdk,
 which the runtime does ship but often below the >=0.125.0 floor that
 w.postgres.generate_database_credential requires: NEVER pip-upgrade pandas, numpy or pyarrow
 on a cluster, because the runtime pins those three against its own Spark build and replacing
-them breaks Spark in ways that surface far from the change. app/requirements.txt carries what
+them breaks Spark in ways that surface far from the change. The root requirements.txt carries what
 the Databricks App consumes (streamlit, databricks-sql-connector, psycopg[binary,pool],
 databricks-sdk, pyyaml, requests); the app has no SparkSession and fits no models, so it needs
 no statsmodels. Lakebase uses psycopg v3 rather than psycopg2 because the proven connection
 pattern (C-2) depends on psycopg_pool.ConnectionPool with per-connection OAuth credentials.
 The frozen architecture doc is silent on dependency files and is unaffected by this split.
+
+THE APP'S TWO FILES MOVED TO THE ROOT (C-5, after the first deploy failed). They were app/app.yaml
+and app/requirements.txt, which reads like the tidier layout and cannot work: a Databricks App
+reads app.yaml and requirements.txt from the root of ITS SOURCE PATH, and this app imports src/
+and reads config/config.yaml, so the source path has to be the whole repository. Pointing Source
+at app/ finds a manifest but deploys a tree with no src/ and no config/; leaving the manifest in
+app/ while pointing Source at the root finds no manifest at all. Both files therefore sit at the
+root, `command` is `app/app.py` relative to that root, and what used to be the root
+requirements.txt is now requirements-dev.txt. The naming is worse and the deployment works;
+tests/test_app_pages.py asserts the manifest is at the root and that its command path resolves.
 
 ENVIRONMENT NOTE (C-1): psycopg KILLS THE SERVERLESS NOTEBOOK KERNEL, so Lakebase is
 app-container-only.
@@ -919,8 +937,8 @@ Model C).
 5. Local secrets: copy .env.example to .env and fill in real values. .env is git-ignored and
    local-only — Databricks jobs read their secrets from secret scopes (A-0) and the deployed
    app gets configuration from app resources / app.yaml, so neither reads .env. python-dotenv
-   is in requirements.txt for this and is deliberately absent from requirements-databricks.txt
-   and app/requirements.txt.
+   is in requirements-dev.txt for this and is deliberately absent from
+   requirements-databricks.txt and from the app's root requirements.txt.
 
 ## C-b Where Spark actually runs
 Only ingestion/pipelines use Spark. Modeling code must not import pyspark. The
@@ -932,7 +950,8 @@ defaults are fine.
 ## C-c Environment installs
 Serverless/interactive notebooks: %pip install statsmodels exchange_calendars at the
 top, or set the job environment's dependencies so workflow tasks get them. The
-Streamlit app gets its packages from the app's requirements.txt automatically.
+Streamlit app gets its packages from the requirements.txt at its source root — the repository
+root — automatically.
 
 ## C-d Verify-first list (run these checks before building on each)
 □ Massive smoke test 200 (A-0)                  □ secret scope readable in notebook

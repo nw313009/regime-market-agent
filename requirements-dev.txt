@@ -1,0 +1,56 @@
+# LOCAL DEVELOPMENT ENVIRONMENT ONLY — Python 3.12 venv (spec B0).
+#
+# Fully pinned so local runs are reproducible: pytest against the pure-pandas modeling layer,
+# plus editor and type support. Versions are the current releases as of 2026-08-09.
+#
+# statsmodels must stay at 0.14.6 or later: earlier versions fail to import under pandas 3.
+#
+# DO NOT install this file on a Databricks cluster. It pins pandas and numpy exactly, and
+# NEVER pip-upgrade pandas, numpy or pyarrow on a cluster — the runtime pins those three
+# against its own Spark build, and replacing them breaks Spark in ways that surface far from
+# the change. For notebooks and job environments use requirements-databricks.txt, which lists
+# only the four packages the runtime actually lacks.
+#
+# The Streamlit app does not read this file either. It reads the ROOT requirements.txt, which is
+# the app's file — the two were swapped when the app's source root became the repository root
+# (a Databricks App reads app.yaml and requirements.txt from the root of its source path, and the
+# app needs src/ and config/ deployed alongside it, so the root is the only workable source).
+#
+#   local venv     -> requirements-dev.txt          (this file)
+#   cluster        -> requirements-databricks.txt
+#   Databricks App -> requirements.txt + app.yaml, both at the repository root
+
+# Modeling (pandas/statsmodels layer — Checkpoint B)
+statsmodels==0.14.6
+pandas==3.0.5
+numpy==2.5.2
+
+# Trading-calendar arithmetic (XNYS sessions; never weekday arithmetic)
+exchange_calendars==4.13.2
+
+# Data access: Delta over a serverless SQL warehouse, Lakebase over Postgres.
+databricks-sql-connector==4.4.0
+
+# psycopg v3, binary build, with the pool extra. The pool extra is required rather than
+# optional: the proven Lakebase pattern authenticates each pooled connection with its own
+# short-lived OAuth token via psycopg_pool.ConnectionPool.
+psycopg[binary,pool]==3.3.4
+
+# Workspace SDK. w.postgres.generate_database_credential mints the per-connection Postgres
+# OAuth credential; 0.125.0 is the floor for that call.
+databricks-sdk>=0.125.0
+
+# Application
+streamlit==1.61.1
+
+# Massive REST client and config loading
+requests==2.34.2
+PyYAML==6.0.3
+
+# Tests
+pytest==9.1.1
+
+# Local .env loading. Deliberately absent from requirements-databricks.txt and from the app's
+# root requirements.txt: jobs read secret scopes and the deployed app reads app resources, so
+# nothing outside local development should ever load a .env file.
+python-dotenv==1.2.2

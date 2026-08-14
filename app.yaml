@@ -1,14 +1,16 @@
 # Databricks App manifest (spec C-5).
 #
 # Declares how the Streamlit app starts and what environment it gets: SQL warehouse id,
-# catalog, and the Lakebase connection. The app's Python packages come from the repository
+# catalog, and the Lakebase connection. The app's Python packages come from the root
 # requirements.txt automatically.
+#
+# THIS FILE LIVES AT THE REPOSITORY ROOT, and the app's Source must be set to the repository root
+# to match. A Databricks App reads app.yaml and requirements.txt from the root of its source path,
+# and `command` below is relative to that same root. Pointing Source at app/ would find this file
+# nowhere and deploy a tree with no src/ and no config/, which the pages import and read.
 #
 # No secrets in this file. Values are either workspace resource ids or references the
 # workspace resolves at runtime.
-#
-# Workspace values filled in at deploy time. ONE IS STILL OPEN: LAKEBASE_USER, which cannot be
-# known until the app exists, because it is the app's own service principal.
 #
 # TWO SETS OF GRANTS, and neither is optional. Both look like application bugs when missing:
 #   Lakebase   the SP added as a Postgres role via the regime-market-database OAuth tab, then
@@ -74,13 +76,11 @@ env:
   - name: LAKEBASE_DATABASE
     value: "databricks_postgres"
   # The Postgres role the app connects as. NOT a human email: an app authenticates as its own
-  # service principal, and that principal's Postgres role name is its CLIENT ID (a UUID). Read it
-  # off the app's page from the field explicitly labelled service principal / client id — the
-  # "App ID" on the overview is not necessarily the same thing. The same UUID is what gets added
-  # as a Postgres role in the Lakebase OAuth tab, so one lookup serves both.
-  # TODO: the last unfilled value in this file.
+  # service principal, and that principal's Postgres role name is its CLIENT ID (a UUID). This is
+  # the same UUID that must exist as a Postgres role in the Lakebase OAuth tab and hold USAGE on
+  # market_system — the value here and the grant there are two halves of one thing.
   - name: LAKEBASE_USER
-    value: "REPLACE_ME_app_service_principal_client_id"
+    value: "9911c419-f30e-4fd5-b7f5-33cf8619e078"
   # Endpoint resource name passed to w.postgres.generate_database_credential. Without it there is
   # no way to mint the per-connection credential, so the app cannot connect at all.
   - name: LAKEBASE_ENDPOINT

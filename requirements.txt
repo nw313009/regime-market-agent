@@ -1,53 +1,38 @@
-# LOCAL DEVELOPMENT ENVIRONMENT ONLY — Python 3.12 venv (spec B0).
+# THE DATABRICKS APP'S dependencies (Streamlit), installed automatically at deploy time.
 #
-# Fully pinned so local runs are reproducible: pytest against the pure-pandas modeling layer,
-# plus editor and type support. Versions are the current releases as of 2026-08-09.
+# IT IS AT THE REPOSITORY ROOT BECAUSE THE APP'S SOURCE ROOT IS THE REPOSITORY ROOT. A Databricks
+# App reads app.yaml and requirements.txt from the root of whatever source path it is pointed at,
+# and this app imports src/ and reads config/config.yaml — so pointing it at app/ would deploy a
+# tree missing both. The root is therefore the only workable source path, and these two files
+# followed it here. What used to be at this path is now requirements-dev.txt.
 #
-# statsmodels must stay at 0.14.6 or later: earlier versions fail to import under pandas 3.
+#   local venv     -> requirements-dev.txt
+#   cluster        -> requirements-databricks.txt
+#   Databricks App -> requirements.txt              (this file) + app.yaml
 #
-# DO NOT install this file on a Databricks cluster. It pins pandas and numpy exactly, and
-# NEVER pip-upgrade pandas, numpy or pyarrow on a cluster — the runtime pins those three
-# against its own Spark build, and replacing them breaks Spark in ways that surface far from
-# the change. For notebooks and job environments use requirements-databricks.txt, which lists
-# only the four packages the runtime actually lacks.
+# Scope: only what the three pages need to render. The app has no SparkSession and does no model
+# fitting, so statsmodels, numpy and exchange_calendars are deliberately absent — it reads Gold
+# numbers the pipeline already computed. DO NOT ADD THEM BACK to make an import work: an import
+# that needs them in the app is an import the app should not be making.
 #
-# The Streamlit app does not read this file either; it reads app/requirements.txt.
-#
-#   local venv    -> requirements.txt              (this file)
-#   cluster       -> requirements-databricks.txt
-#   Databricks App-> app/requirements.txt
+# Never pip-upgrade pandas, numpy or pyarrow on a Databricks CLUSTER either; the runtime pins
+# those three against its own Spark build.
 
-# Modeling (pandas/statsmodels layer — Checkpoint B)
-statsmodels==0.14.6
-pandas==3.0.5
-numpy==2.5.2
-
-# Trading-calendar arithmetic (XNYS sessions; never weekday arithmetic)
-exchange_calendars==4.13.2
-
-# Data access: Delta over a serverless SQL warehouse, Lakebase over Postgres.
-databricks-sql-connector==4.4.0
-
-# psycopg v3, binary build, with the pool extra. The pool extra is required rather than
-# optional: the proven Lakebase pattern authenticates each pooled connection with its own
-# short-lived OAuth token via psycopg_pool.ConnectionPool.
-psycopg[binary,pool]==3.3.4
-
-# Workspace SDK. w.postgres.generate_database_credential mints the per-connection Postgres
-# OAuth credential; 0.125.0 is the floor for that call.
-databricks-sdk>=0.125.0
-
-# Application
 streamlit==1.61.1
 
-# Massive REST client and config loading
-requests==2.34.2
+# Delta reads over the serverless SQL warehouse declared in app.yaml.
+databricks-sql-connector==4.4.0
+
+# Lakebase (Postgres): watchlist and saved reports. psycopg v3 with the pool extra, because
+# the app holds a long-lived ConnectionPool whose connections each carry their own OAuth token.
+psycopg[binary,pool]==3.3.4
+
+# Required by the Lakebase connection pattern: the app's service principal calls
+# w.postgres.generate_database_credential to authenticate each connection.
+databricks-sdk>=0.125.0
+
+# config/config.yaml loading.
 PyYAML==6.0.3
 
-# Tests
-pytest==9.1.1
-
-# Local .env loading. Deliberately absent from requirements-databricks.txt and
-# app/requirements.txt: jobs read secret scopes and the deployed app reads app resources, so
-# nothing outside local development should ever load a .env file.
-python-dotenv==1.2.2
+# Model serving calls made through src/llm/call_model.py.
+requests==2.34.2
