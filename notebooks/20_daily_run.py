@@ -59,6 +59,37 @@ from src.pipelines import (  # noqa: E402
 )
 
 
+#: The scope A-0 created. Both ingestion tasks read the Massive key from it; Lakebase's two keys
+#: live in the same scope and are named in src/pipelines/lakebase_history.SECRET_KEYS.
+SECRET_SCOPE = "capstone"
+
+
+def massive_secret_getter():
+    """The Massive API key reader for this run, or ``None`` to use ingestion's own fallback.
+
+    A JOB HAS NO ENVIRONMENT VARIABLES. ``MassiveClient`` defaults to ``env_secret_getter()``,
+    which reads MASSIVE_API_KEY — correct locally, absent on serverless, and the failure surfaces
+    as MassiveAuthError from inside the first fetch rather than as a missing configuration.
+
+    Resolved per call, not at import: dbutils exists only in a workspace, and this module is also
+    imported by tests and run from the CLI. Returning ``None`` there is deliberate — it hands
+    ingest_*.main the ``secret_getter or env_secret_getter()`` path it was built with.
+    """
+    dbu = notebook_dbutils()
+    if dbu is None:
+        return None
+    return lambda: dbu.secrets.get(scope=SECRET_SCOPE, key="massive_api_key")
+
+
+def ingest_prices_task(spark, config: dict) -> dict:
+    """Wiring only: the key comes from the scope in a workspace, from the environment locally."""
+    return ingest_prices.main(spark, config, secret_getter=massive_secret_getter())
+
+
+def ingest_news_task(spark, config: dict) -> dict:
+    return ingest_news.main(spark, config, secret_getter=massive_secret_getter())
+
+
 def build_silver(spark, config: dict) -> dict:
     """Both silver builds, in one task (spec C-6).
 
@@ -94,8 +125,8 @@ def sync_lakebase_history(spark, config: dict) -> dict:
 #: tests/test_workflow.py asserts the two sets are identical — a task the job schedules but this
 #: file cannot run would fail at 22:30 UTC rather than at edit time.
 TASKS = {
-    "ingest_prices": lambda spark, config: ingest_prices.main(spark, config),
-    "ingest_news": lambda spark, config: ingest_news.main(spark, config),
+    "ingest_prices": ingest_prices_task,
+    "ingest_news": ingest_news_task,
     "build_silver": build_silver,
     "build_features": lambda spark, config: feature_pipeline.main(spark, config),
     "refresh_news_recent": lambda spark, config: news_recent.refresh(spark, config),

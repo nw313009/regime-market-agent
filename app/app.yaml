@@ -7,9 +7,19 @@
 # No secrets in this file. Values are either workspace resource ids or references the
 # workspace resolves at runtime.
 #
-# TODO: replace every placeholder below with the real workspace values, and confirm the
-# app's service principal has USE CATALOG / SELECT on market_intel and CAN USE on the
-# warehouse. "App can't read Delta" is nearly always a permissions problem here.
+# Workspace values filled in at deploy time. ONE IS STILL OPEN: LAKEBASE_USER, which cannot be
+# known until the app exists, because it is the app's own service principal.
+#
+# TWO SETS OF GRANTS, and neither is optional. Both look like application bugs when missing:
+#   Lakebase   the SP added as a Postgres role via the regime-market-database OAuth tab, then
+#              USAGE on schema market_system plus table DML. Missing → "password authentication
+#              failed for user '<uuid>'", which is not a password problem.
+#   Unity Cat. the SP granted USE CATALOG + SELECT on market_intel, and CAN USE on the warehouse.
+#              Missing → the app starts fine and every Delta query fails.
+#
+# EDIT THIS FILE IN GIT, NEVER IN THE WORKSPACE EDITOR. The app's source is a Git folder; editing
+# it in place makes the workspace and the repository disagree about what is deployed, and the
+# workspace copy is the one that gets overwritten by the next pull.
 
 command: ["streamlit", "run", "app/app.py"]
 
@@ -26,14 +36,14 @@ env:
   # naming it here means the connection does not depend on that injection continuing to happen.
   # Host WITHOUT the https:// prefix — the connector wants a hostname, not a URL.
   - name: DATABRICKS_SERVER_HOSTNAME
-    value: "REPLACE_ME_workspace_host"   # e.g. dbc-1234abcd-5678.cloud.databricks.com
+    value: "dbc-47c4ef4d-9564.cloud.databricks.com"
 
   # Serverless SQL warehouse the app queries Delta through. The id is what an app resource
   # binding provides; the path is derived from it as /sql/1.0/warehouses/<id>.
   - name: DATABRICKS_WAREHOUSE_ID
-    value: "REPLACE_ME_warehouse_id"
+    value: "e92f4e2b2c11fc10"
   - name: DATABRICKS_HTTP_PATH
-    value: "/sql/1.0/warehouses/REPLACE_ME_warehouse_id"
+    value: "/sql/1.0/warehouses/e92f4e2b2c11fc10"
 
   # NO DATABRICKS_TOKEN. When it is absent the connector authenticates as the app's own service
   # principal through the SDK's credentials provider, which is the whole point of running as one.
@@ -58,14 +68,19 @@ env:
   # regime-market-database project's OAuth tab, then grant it USAGE on schema market_system plus
   # table privileges. Missing grants look like an application bug at deploy time; they are not.
   - name: LAKEBASE_HOST
-    value: "REPLACE_ME_lakebase_host"
+    value: "ep-lingering-brook-d8izukis.database.us-east-2.cloud.databricks.com"
   - name: LAKEBASE_PORT
     value: "5432"
   - name: LAKEBASE_DATABASE
     value: "databricks_postgres"
-  # The Postgres role the app connects as — the service principal created in the OAuth tab above.
+  # The Postgres role the app connects as. NOT a human email: an app authenticates as its own
+  # service principal, and that principal's Postgres role name is its CLIENT ID (a UUID). Read it
+  # off the app's page from the field explicitly labelled service principal / client id — the
+  # "App ID" on the overview is not necessarily the same thing. The same UUID is what gets added
+  # as a Postgres role in the Lakebase OAuth tab, so one lookup serves both.
+  # TODO: the last unfilled value in this file.
   - name: LAKEBASE_USER
-    value: "REPLACE_ME_app_service_principal"
+    value: "REPLACE_ME_app_service_principal_client_id"
   # Endpoint resource name passed to w.postgres.generate_database_credential. Without it there is
   # no way to mint the per-connection credential, so the app cannot connect at all.
   - name: LAKEBASE_ENDPOINT
