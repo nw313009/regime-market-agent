@@ -219,6 +219,36 @@ setup/create_lakebase.sql in the SQL editor — all four tables exist and REPLIC
 verified on watchlist_tickers and research_reports. ensure_tables() stays for the app's startup
 path and as the executable record of the DDL.
 
+ENVIRONMENT NOTE (C-6): SERVERLESS COMPUTE CANNOT REACH THE LAKEBASE ENDPOINT, so the CDC sync
+reads through Lakehouse Federation. This is the second wall between this project's compute and its
+own Postgres, and it is a different wall from the first.
+
+Symptom, observed: sync_lakebase_history over Spark JDBC never connected — not once, on any run.
+A pre-flight isolated it to DNS: the Lakebase endpoint's hostname does not resolve from serverless
+compute. Not credentials, not TLS, not a missing driver, and therefore not fixable by any of the
+things the JDBC design was careful about. Installing a bundled connector to route around it is
+blocked by workspace library policy, which is the same wall wearing a hat.
+
+Route that works, proven end to end before any code changed: a Unity Catalog CONNECTION
+(regime_lakebase_conn) and the FOREIGN CATALOG over it (regime_lakebase) make the Postgres schema
+readable as regime_lakebase.market_system.* from plain spark.sql on serverless. The seed
+watchlist row came back with its Postgres timestamp intact. Federation puts the routing inside the
+workspace's control plane instead of ours, which is exactly why it succeeds where our own socket
+could not.
+
+What it costs: a UC connection stores ONE STATIC CREDENTIAL, and the OAuth tokens this task used
+to mint expire hourly, so the connection cannot carry one. It authenticates instead as a native
+Postgres role, federation_reader, with SELECT only on market_system and a password held in the
+connection object — a role created solely because of that constraint. Nothing about it is in this
+repository and rule 5 holds. The blast radius is reading two tables.
+
+What it does not cost: the Delta write side, which did not move. The transport was an injected
+`read` callable from the start (it was written that way for a different anticipated failure), so
+the swap replaced one function and deleted three; the watermark, the row shaping and the MERGE are
+untouched. access_token(), jdbc_options() and jdbc_url() are GONE rather than kept for a rainy
+day — the app reaches Postgres with psycopg and has no use for them, and a dead second transport
+is a thing a future reader has to disprove.
+
 config.yaml keys: massive.base_url, massive.rate_limit_per_min,
 massive.backfill_start_date="2024-08-01", tickers.seed[5],
 forecast.horizon_days=5, forecast.n_paths=5000, forecast.seed=42,
@@ -235,20 +265,23 @@ backfill_floor only when it is true. As two keys, an operator flipping one of th
 whose nightly refresh deletes exactly what its backfill just added — a bug that costs a warehouse
 every night and presents as "the news window never gets longer".
 
-lakebase.* (host, port, database, user, schema, endpoint) is the non-secret half of the Lakebase
-connection, read by src/pipelines/lakebase_history.py. The job cannot import
-src/database/lakebase.py to get these — that module imports psycopg — so four strings are
-duplicated rather than shared. There is no password key and there must never be one: the
-credential is minted per run.
+lakebase.* has two halves and only the first is read by code. federated_catalog=regime_lakebase
+and schema=market_system are what src/pipelines/lakebase_history.py uses to build the three-level
+name it reads (see the C-6 environment note above). There is no password key and there must never
+be one; the credential lives in the UC connection.
 
-host AND user SHIP EMPTY and come from the `capstone` secret scope (keys lakebase_host,
-lakebase_user), read by lakebase_history.env_from_secrets and handed in by the dispatcher
-notebook, which is the only place dbutils exists. Not because they are secrets — they are not,
-and the block says so — but because this repository is public and they are workspace
-infrastructure. The usual answer, an environment variable on the job, is unavailable: a serverless
-notebook task cannot be given one. Resolution order is environment variable, then secret, then
-this file, and a missing secret falls through rather than raising, so the error when nothing
-supplies a value still names all three places to look.
+host, port, database, user and endpoint are THE APP'S connection, and nothing reads them — the app
+takes those from app.yaml's PG* environment. They stay as the record of what the other Lakebase
+client connects to, in the file that describes the project's plumbing, and the block says plainly
+that they are documentation rather than configuration. The alternative, deleting them, loses the
+only place the two Lakebase clients are described together.
+
+A NOTE FOR ANYONE READING THE HISTORY: host and user shipped empty and were read from the
+`capstone` secret scope (keys lakebase_host, lakebase_user, wired in at f4a07f1) because a
+serverless notebook task cannot be given environment variables and this repository is public. That
+mechanism worked exactly as designed and is now unnecessary — the transport it supplied was the
+one that could not resolve the host. env_from_secrets was deleted with the JDBC code. The secrets
+themselves are harmless and were left in the scope.
 
 workflow.* (job_name, schedule_quartz="0 30 22 * * ?", timezone=UTC, paused=true,
 notebook_path, ingestion_retries=2) is read only by setup/create_workflow.py. notebook_path ships
@@ -874,22 +907,18 @@ Decisions taken where the above is silent (C-6 implementation):
   The backfill reads its cursor from MIN(published_at) in the table rather than from a stored
   watermark row — a cursor and the rows it describes are two things that can disagree, and the fix
   for that disagreement is to recompute the cursor from the data.
-- sync_lakebase_history reaches Postgres over SPARK JDBC, feasibility verified against the installed
-  databricks-sdk 0.125.0 rather than recalled: w.postgres.generate_database_credential(endpoint=...)
-  returns a DatabaseCredential.token usable as a password over a plain HTTPS call that imports no
-  Postgres driver, and the SDK offers NO Spark integration for Postgres (PostgresAPI manages
-  infrastructure and mints credentials; its own docstring points at direct SQL connections for
-  data). So the read is spark.read.format("jdbc") with the driver Databricks Runtime ships,
-  sslmode=require, and the minted token as the password. Nothing is stored.
-  THE APP-SIDE ALTERNATIVE, if JDBC is blocked by workspace egress rules or a missing driver: the
-  transport is the injected `read` callable and everything after it — the watermark read, the row
-  shaping, the MERGE — takes plain dicts, so the swap is one function. The app-side version reads
-  the two tables through src/database/lakebase.py (psycopg works in the app container, where it is
-  proven) and writes through src/database/delta.py over the SQL warehouse, which executes a MERGE
-  as happily as a SELECT; it would run on the app's startup path or behind a button on the agent
-  page, which costs the daily cadence and keeps the capability. It is deliberately NOT implemented
-  as a second live path: two syncs writing the same two tables on different schedules is a worse
-  failure than one sync that has to be triggered by hand.
+- sync_lakebase_history reads Postgres THROUGH LAKEHOUSE FEDERATION: spark.sql against
+  regime_lakebase.market_system.<table>, where regime_lakebase is a UC foreign catalog over
+  connection regime_lakebase_conn. It shipped as Spark JDBC with a per-run OAuth token and was
+  amended after that transport turned out to be impossible from serverless compute at all — the
+  endpoint's hostname does not resolve there. The full diagnosis, the federation_reader role it
+  requires, and what was deleted are in the C-6 environment note in B0.
+  The amendment cost one function: read_source(). The transport was already an injected `read`
+  callable and everything after it — the watermark read, the row shaping, the MERGE — takes plain
+  dicts, so nothing downstream moved. The app-side sync that seam was designed for is therefore
+  still available and still not implemented, for the original reason: two syncs writing the same
+  two tables on different schedules is a worse failure than one sync that has to be triggered by
+  hand.
   The watermark is each TARGET's own MAX(added_at / created_at), compared with >= so a second row
   sharing the boundary timestamp cannot be skipped forever, and the write is a MERGE on the source
   primary key so re-reading the boundary updates in place. A DELETE in Postgres removes nothing from
@@ -986,12 +1015,17 @@ create_ai_search.main() runs silently → an old copy without narrate(). Every p
 Every sync leaves the index resyncing for minutes and the embedding bill climbs → the refresh is
   rewriting unchanged rows. news_recent.unchanged_predicate is what prevents that; a MERGE without
   it re-embeds the whole window nightly.
-sync_lakebase_history fails with "no suitable driver" or a connection timeout → job-side JDBC to
-  Lakebase is blocked in this workspace. The app-side alternative is documented in C-6 and in
-  src/pipelines/lakebase_history.py; the transport is one injected function.
-sync_lakebase_history fails with "lakebase host, user not configured" → the `capstone` scope is
-  missing lakebase_host / lakebase_user. Add them with the CLI (databricks secrets put-secret);
-  they cannot be created from a notebook, and config.yaml ships them empty on purpose.
+sync_lakebase_history fails with an unresolved host, a connection timeout, or "no suitable driver"
+  → you are looking at an old copy that still uses JDBC. Serverless cannot reach the Lakebase
+  endpoint by any socket it opens itself; the sync reads through the regime_lakebase foreign
+  catalog. See the C-6 environment note.
+sync_lakebase_history fails with "lakebase.federated_catalog is not set" → config.yaml is older
+  than the federation amendment, or the key was emptied. It is not a secret and belongs in the file.
+sync_lakebase_history fails with TABLE_OR_VIEW_NOT_FOUND on regime_lakebase.* → the foreign catalog
+  or its connection does not exist in this workspace, or the job's principal lacks USE CATALOG on
+  it. Both are workspace grants, not code.
+sync_lakebase_history returns zero rows while Postgres visibly has some → federation_reader cannot
+  see them. It is SELECT-only on market_system by design; a table added later needs its own grant.
 The news window never gets longer despite running the backfill → news_recent.include_backfill is
   false, so the daily refresh is deleting what the backfill adds. One key controls both.
 

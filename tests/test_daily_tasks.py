@@ -15,6 +15,7 @@ that costs a warehouse every night and shows up as "the page's news list never g
 
 from __future__ import annotations
 
+import inspect
 from datetime import date, datetime, timezone
 from pathlib import Path
 
@@ -41,11 +42,14 @@ def config(**overrides) -> dict:
         "include_backfill": False,
     }
     resolved["lakebase"] = {
+        "federated_catalog": "regime_lakebase",
+        "schema": "market_system",
+        # The app's half of the block. Nothing under src/ reads these; they are here so a test
+        # that accidentally starts depending on them fails against the shipped shape.
         "host": "lakebase.example.databricks.com",
         "port": 5432,
         "database": "databricks_postgres",
         "user": "app-sp",
-        "schema": "market_system",
         "endpoint": "projects/regime-market-database/branches/production/endpoints/primary",
     }
     for key, value in overrides.items():
@@ -289,36 +293,15 @@ class TestNewsRecentTasks:
 # ===================================================================== lakebase_history
 
 
-class FakeCredential:
-    def __init__(self, token: str = "oauth-token-abc"):
-        self.token = token
-
-
-class FakePostgresAPI:
-    def __init__(self):
-        self.calls: list[str] = []
-
-    def generate_database_credential(self, endpoint: str):
-        self.calls.append(endpoint)
-        return FakeCredential()
-
-
-class FakeWorkspaceClient:
-    def __init__(self):
-        self.postgres = FakePostgresAPI()
-
-
 class FakeReader:
-    """Stands in for the JDBC read. Records what it was asked for; returns canned Postgres rows."""
+    """Stands in for the federated read. Records what it was asked for; returns canned rows."""
 
     def __init__(self, rows: dict[str, list[dict]] | None = None):
         self.rows = dict(rows or {})
         self.calls: list[dict] = []
 
-    def __call__(self, spark, connection, table, since, token):
-        self.calls.append(
-            {"table": table.source, "since": since, "token": token, "connection": connection}
-        )
+    def __call__(self, spark, source, table, since):
+        self.calls.append({"table": table.source, "since": since, "source": source})
         return self.rows.get(table.source, [])
 
 
@@ -339,98 +322,84 @@ REPORT_ROW = {
 }
 
 
-class TestLakebaseConnection:
-    def test_the_url_requires_tls(self):
-        connection = lakebase_history.connection_from_config(config(), env={})
-        assert connection.jdbc_url() == (
-            "jdbc:postgresql://lakebase.example.databricks.com:5432/databricks_postgres?sslmode=require"
-        )
+class TestFederatedSource:
+    """The transport, after JDBC turned out to be unreachable from serverless compute.
 
-    def test_the_environment_wins_over_the_checked_in_config(self):
-        connection = lakebase_history.connection_from_config(
-            config(), env={"PGHOST": "override.example.com", "PGUSER": "someone-else"}
-        )
-        assert connection.host == "override.example.com"
-        assert connection.user == "someone-else"
-
-    def test_missing_settings_fail_with_the_names_to_fix(self):
-        with pytest.raises(ValueError, match="host, user") as raised:
-            lakebase_history.connection_from_config(
-                config(lakebase={"host": "", "user": ""}), env={}
-            )
-
-        # All three places a value can come from, because the reader does not know which one the
-        # operator chose and "not configured" without a where is a scavenger hunt.
-        message = str(raised.value)
-        assert "secret scope" in message
-        assert "config.yaml" in message
-        assert "PGHOST" in message
-
-
-class TestSecretScopeFallback:
-    """Host and role come from the `capstone` scope: not secrets, but not for a public repo.
-
-    A serverless notebook task cannot be given environment variables, so a scope is the only way
-    to supply them without committing them.
+    Serverless cannot resolve the Lakebase endpoint's hostname, so the read goes through a Unity
+    Catalog foreign catalog instead and the task's whole connection story is two strings.
     """
 
-    def test_secrets_are_read_as_the_env_names_they_stand_in_for(self):
-        fetched = []
+    def test_the_source_is_the_foreign_catalog_and_its_schema(self):
+        source = lakebase_history.source_from_config(config())
 
-        def getter(scope, key):
-            fetched.append((scope, key))
-            return {"lakebase_host": "real.databricks.com", "lakebase_user": "someone"}[key]
+        assert source.catalog == "regime_lakebase"
+        assert source.schema == "market_system"
 
-        assert lakebase_history.env_from_secrets(getter) == {
-            "PGHOST": "real.databricks.com",
-            "PGUSER": "someone",
-        }
-        assert {scope for scope, _ in fetched} == {"capstone"}
+    def test_the_table_name_is_three_level(self):
+        source = lakebase_history.source_from_config(config())
+        table = lakebase_history.HISTORY_TABLES[0]
 
-    def test_the_secrets_satisfy_the_connection_the_empty_config_cannot(self):
-        """End to end: what the shipped config leaves blank, the scope fills."""
-        shipped = config(lakebase={"host": "", "user": "", "endpoint": "projects/p/branches/b/endpoints/e"})
-        env = lakebase_history.env_from_secrets(
-            lambda scope, key: {"lakebase_host": "real.databricks.com", "lakebase_user": "someone"}[key]
+        assert source.table_fqn(table) == "regime_lakebase.market_system.watchlist_tickers"
+
+    def test_the_schema_defaults_to_market_system(self):
+        source = lakebase_history.source_from_config(
+            config(lakebase={"federated_catalog": "regime_lakebase", "schema": ""})
         )
+        assert source.schema == "market_system"
 
-        connection = lakebase_history.connection_from_config(shipped, env=env)
+    def test_a_missing_catalog_says_what_it_is_and_why(self):
+        with pytest.raises(ValueError, match="federated_catalog") as raised:
+            lakebase_history.source_from_config(config(lakebase={"federated_catalog": ""}))
 
-        assert connection.host == "real.databricks.com"
-        assert connection.user == "someone"
+        message = str(raised.value)
+        assert "foreign catalog" in message
+        # The reason, not just the name: an operator who does not know why federation is involved
+        # will otherwise go looking for the host and port sitting right there in the same block.
+        assert "cannot resolve" in message
 
-    def test_a_missing_secret_falls_through_instead_of_raising(self):
-        """The scope is one of three sources; failing here would hide the other two."""
+    def test_no_credential_is_needed_or_accepted(self):
+        """UC holds the connection's credential. A token here would be a second answer to it."""
+        assert not hasattr(lakebase_history, "access_token")
+        assert not hasattr(lakebase_history, "jdbc_options")
 
-        def getter(scope, key):
-            raise Exception(f"Secret does not exist with scope: {scope} and key: {key}")
+        parameters = inspect.signature(lakebase_history.main).parameters
+        assert "workspace_client" not in parameters
+        assert "token" not in parameters
 
-        assert lakebase_history.env_from_secrets(getter) == {}
+    def test_the_host_and_role_in_config_reach_nothing(self):
+        """They describe the app's connection now. The sync must not start depending on them."""
+        source = lakebase_history.source_from_config(
+            config(lakebase={"host": "", "user": "", "endpoint": ""})
+        )
+        assert source.catalog == "regime_lakebase"
 
-    def test_a_blank_secret_is_not_an_override(self):
-        # An empty secret must not shadow a filled-in config value with "".
-        assert lakebase_history.env_from_secrets(lambda scope, key: "") == {}
 
-    def test_the_password_is_minted_and_never_stored(self):
-        """The whole reason this task can exist without a secret: a per-run OAuth token."""
-        connection = lakebase_history.connection_from_config(config(), env={})
-        client = FakeWorkspaceClient()
+class TestFederatedRead:
+    """``read_source`` itself, which the tests above stub out."""
 
-        token = lakebase_history.access_token(connection, client)
+    def test_the_read_is_one_spark_sql_against_the_foreign_catalog(self):
+        source = lakebase_history.source_from_config(config())
+        table = lakebase_history.HISTORY_TABLES[0]
+        spark = AnsweringSpark({"FROM regime_lakebase": FakeResult(rows=[WATCHLIST_ROW])})
 
-        assert token == "oauth-token-abc"
-        assert client.postgres.calls == [connection.endpoint]
-        options = lakebase_history.jdbc_options(connection, token)
-        assert options["password"] == token
-        assert token not in options["url"], "the token must not travel in the URL"
+        rows = lakebase_history.read_source(spark, source, table, None)
 
-    def test_a_credential_without_a_token_is_an_error_not_a_none_password(self):
-        connection = lakebase_history.connection_from_config(config(), env={})
-        client = FakeWorkspaceClient()
-        client.postgres.generate_database_credential = lambda endpoint: FakeCredential("")
+        assert rows == [{column: WATCHLIST_ROW[column] for column in table.columns}]
+        assert len(spark.statements) == 1
+        assert "regime_lakebase.market_system.watchlist_tickers" in spark.statements[0]
 
-        with pytest.raises(RuntimeError, match="no token"):
-            lakebase_history.access_token(connection, client)
+    def test_it_projects_only_the_columns_the_history_table_holds(self):
+        source = lakebase_history.source_from_config(config())
+        table = lakebase_history.HISTORY_TABLES[1]
+        noisy = {**REPORT_ROW, "internal_column": "not ours"}
+        spark = AnsweringSpark({"FROM regime_lakebase": FakeResult(rows=[noisy])})
+
+        rows = lakebase_history.read_source(spark, source, table, None)
+
+        assert set(rows[0]) == set(table.columns)
+
+
+SOURCE = lakebase_history.FederatedSource("regime_lakebase")
 
 
 class TestWatermarkSync:
@@ -438,46 +407,47 @@ class TestWatermarkSync:
         spark = AnsweringSpark()  # max(...) returns no row at all
         reader = FakeReader()
 
-        lakebase_history.main(spark, config(), workspace_client=FakeWorkspaceClient(), read=reader)
+        lakebase_history.main(spark, config(), read=reader)
 
         assert [call["since"] for call in reader.calls] == [None, None]
         for table in lakebase_history.HISTORY_TABLES:
-            assert lakebase_history.source_query(table, "market_system", None).count("WHERE") == 0
+            assert lakebase_history.source_query(table, SOURCE, None).count("WHERE") == 0
 
     def test_a_later_run_reads_only_what_is_newer(self):
         watermark = datetime(2026, 8, 11, 18, 0, tzinfo=timezone.utc)
         spark = AnsweringSpark({"max(added_at)": FakeResult({"watermark": watermark})})
         reader = FakeReader()
 
-        lakebase_history.main(spark, config(), workspace_client=FakeWorkspaceClient(), read=reader)
+        lakebase_history.main(spark, config(), read=reader)
 
         watchlist_call = next(call for call in reader.calls if call["table"] == "watchlist_tickers")
         assert watchlist_call["since"] == watermark
 
     def test_the_watermark_is_pushed_down_to_postgres(self):
+        """In the WHERE clause, so federation forwards it instead of dragging the table over."""
         table = lakebase_history.HISTORY_TABLES[0]
         since = datetime(2026, 8, 11, 18, 0, tzinfo=timezone.utc)
 
-        sql = lakebase_history.source_query(table, "market_system", since)
+        sql = lakebase_history.source_query(table, SOURCE, since)
 
-        assert "FROM market_system.watchlist_tickers" in sql
-        assert "WHERE added_at >= TIMESTAMP '2026-08-11T18:00:00+00:00'" in sql
+        assert "FROM regime_lakebase.market_system.watchlist_tickers" in sql
+        assert "WHERE added_at >= TIMESTAMP '2026-08-11 18:00:00+00:00'" in sql
 
     def test_the_comparison_includes_the_boundary_row(self):
         """``>`` would drop a second row sharing the boundary timestamp, forever."""
         table = lakebase_history.HISTORY_TABLES[0]
-        sql = lakebase_history.source_query(table, "market_system", datetime(2026, 8, 11))
+        sql = lakebase_history.source_query(table, SOURCE, datetime(2026, 8, 11))
         assert ">=" in sql and " > " not in sql
 
     def test_a_naive_watermark_is_read_as_utc(self):
         table = lakebase_history.HISTORY_TABLES[1]
-        sql = lakebase_history.source_query(table, "market_system", datetime(2026, 8, 11, 18, 0))
-        assert "'2026-08-11T18:00:00+00:00'" in sql
+        sql = lakebase_history.source_query(table, SOURCE, datetime(2026, 8, 11, 18, 0))
+        assert "'2026-08-11 18:00:00+00:00'" in sql
 
     def test_only_a_datetime_can_reach_the_query(self):
         table = lakebase_history.HISTORY_TABLES[0]
         with pytest.raises(TypeError):
-            lakebase_history.source_query(table, "market_system", "2026-08-11' OR 1=1 --")
+            lakebase_history.source_query(table, SOURCE, "2026-08-11' OR 1=1 --")
 
     def test_captured_rows_carry_the_run_timestamp(self, monkeypatch):
         monkeypatch.setattr(lakebase_history, "utc_now", lambda: NOW)
@@ -486,9 +456,7 @@ class TestWatermarkSync:
             {"watchlist_tickers": [WATCHLIST_ROW], "research_reports": [REPORT_ROW]}
         )
 
-        result = lakebase_history.main(
-            spark, config(), workspace_client=FakeWorkspaceClient(), read=reader
-        )
+        result = lakebase_history.main(spark, config(), read=reader)
 
         assert result["captured_at"] == NOW
         staged = [frame for frame in spark.frames if "captured_at" in frame.schema]
@@ -496,21 +464,27 @@ class TestWatermarkSync:
         for frame in staged:
             assert all(row[-1] == NOW for row in frame.rows), "captured_at is the last column"
 
-    def test_both_tables_share_one_token_and_one_capture_time(self):
+    def test_both_tables_share_one_capture_time(self):
         """A shared stamp is what makes "these arrived together" a readable fact."""
-        client = FakeWorkspaceClient()
-        reader = FakeReader({"watchlist_tickers": [WATCHLIST_ROW]})
+        spark = AnsweringSpark()
+        reader = FakeReader({"watchlist_tickers": [WATCHLIST_ROW], "research_reports": [REPORT_ROW]})
 
-        lakebase_history.main(AnsweringSpark(), config(), workspace_client=client, read=reader)
+        result = lakebase_history.main(spark, config(), read=reader)
 
-        assert len(client.postgres.calls) == 1
-        assert {call["token"] for call in reader.calls} == {"oauth-token-abc"}
+        stamps = {
+            row[-1]
+            for frame in spark.frames
+            if "captured_at" in frame.schema
+            for row in frame.rows
+        }
+        assert stamps == {result["captured_at"]}
+        assert len({call["source"] for call in reader.calls}) == 1
 
     def test_the_write_is_a_merge_on_the_source_primary_key(self):
         spark = AnsweringSpark()
         reader = FakeReader({"watchlist_tickers": [WATCHLIST_ROW], "research_reports": [REPORT_ROW]})
 
-        lakebase_history.main(spark, config(), workspace_client=FakeWorkspaceClient(), read=reader)
+        lakebase_history.main(spark, config(), read=reader)
 
         merges = spark.data_merges()
         assert len(merges) == 2
@@ -521,7 +495,7 @@ class TestWatermarkSync:
         spark = AnsweringSpark()
         reader = FakeReader({"watchlist_tickers": [WATCHLIST_ROW], "research_reports": [REPORT_ROW]})
 
-        lakebase_history.main(spark, config(), workspace_client=FakeWorkspaceClient(), read=reader)
+        lakebase_history.main(spark, config(), read=reader)
 
         merged = " ".join(spark.data_merges())
         assert "market_intel.gold.lb_watchlist_tickers_history" in merged
@@ -530,9 +504,7 @@ class TestWatermarkSync:
     def test_nothing_new_writes_nothing_but_still_ledgers(self):
         spark = AnsweringSpark()
 
-        result = lakebase_history.main(
-            spark, config(), workspace_client=FakeWorkspaceClient(), read=FakeReader()
-        )
+        result = lakebase_history.main(spark, config(), read=FakeReader())
 
         assert result["rows_total"] == 0
         assert spark.data_merges() == []
@@ -543,11 +515,18 @@ class TestWatermarkSync:
         reader = FakeReader({"watchlist_tickers": [WATCHLIST_ROW]})
 
         with pytest.raises(RuntimeError):
-            lakebase_history.main(
-                spark, config(), workspace_client=FakeWorkspaceClient(), read=reader
-            )
+            lakebase_history.main(spark, config(), read=reader)
 
         assert spark.ledger_rows()[0]["status"] == "failed"
+
+    def test_an_unconfigured_catalog_fails_before_the_ledger_row(self):
+        """No run record for a task that never started; the message is the whole diagnosis."""
+        spark = AnsweringSpark()
+
+        with pytest.raises(ValueError, match="federated_catalog"):
+            lakebase_history.main(spark, config(lakebase={"federated_catalog": ""}), read=FakeReader())
+
+        assert spark.ledger_rows() == []
 
     def test_the_history_schemas_match_the_delta_ddl(self):
         """A column added to the DDL and forgotten here would arrive as a silent NULL."""
@@ -565,9 +544,7 @@ class TestWatermarkSync:
     def test_a_delete_in_postgres_removes_nothing_here(self):
         """History, not a mirror: the sync only ever reads forward and merges."""
         spark = AnsweringSpark()
-        lakebase_history.main(
-            spark, config(), workspace_client=FakeWorkspaceClient(), read=FakeReader()
-        )
+        lakebase_history.main(spark, config(), read=FakeReader())
         assert spark.deletes() == []
 
 

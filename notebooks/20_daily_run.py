@@ -20,7 +20,6 @@ which is what makes a single failed task re-runnable on its own from the Jobs UI
 """
 
 import logging
-import os
 import sys
 from pathlib import Path
 
@@ -59,8 +58,9 @@ from src.pipelines import (  # noqa: E402
 )
 
 
-#: The scope A-0 created. Both ingestion tasks read the Massive key from it; Lakebase's two keys
-#: live in the same scope and are named in src/pipelines/lakebase_history.SECRET_KEYS.
+#: The scope A-0 created. Both ingestion tasks read the Massive key from it, and they are now the
+#: only readers: the Lakebase keys alongside it fed the JDBC sync, which Lakehouse Federation
+#: replaced.
 SECRET_SCOPE = "capstone"
 
 
@@ -107,20 +107,6 @@ def sync_news_index(spark, config: dict) -> dict:
     return {"index": trigger_sync(settings=search_settings(config))}
 
 
-def sync_lakebase_history(spark, config: dict) -> dict:
-    """Watermark CDC into gold (C-6), with the Lakebase host and role from the secret scope.
-
-    WIRING, NOT LOGIC: ``dbutils`` exists only here, so this is the one place that can hand
-    ``env_from_secrets`` a way to read secrets. Everything it decides lives in the pipeline module.
-
-    A real environment variable still wins over a secret — that is a deliberate override for one
-    run — but a serverless task has none, so in the job the secrets are what answer.
-    """
-    dbu = notebook_dbutils()
-    secrets = {} if dbu is None else lakebase_history.env_from_secrets(dbu.secrets.get)
-    return lakebase_history.main(spark, config, env={**secrets, **os.environ})
-
-
 #: task name -> callable(spark, config). The names are the job's task keys, and
 #: tests/test_workflow.py asserts the two sets are identical — a task the job schedules but this
 #: file cannot run would fail at 22:30 UTC rather than at edit time.
@@ -132,7 +118,9 @@ TASKS = {
     "refresh_news_recent": lambda spark, config: news_recent.refresh(spark, config),
     "fit_models": lambda spark, config: fit_models.main(spark, config),
     "sync_news_index": sync_news_index,
-    "sync_lakebase_history": sync_lakebase_history,
+    # No wiring of its own since the transport became Lakehouse Federation: the read is a
+    # three-level-name spark.sql, so the task needs no credential from dbutils and no environment.
+    "sync_lakebase_history": lambda spark, config: lakebase_history.main(spark, config),
     "backfill_news_recent": lambda spark, config: news_recent.backfill(spark, config),
 }
 

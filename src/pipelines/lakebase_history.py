@@ -5,35 +5,35 @@ in Postgres through the app; this task carries them into ``market_intel.gold.lb_
 lakehouse holds the history of what the application did. Analytical data flows the other way and
 the two never loop (spec A3).
 
-WHY NOT psycopg. The obvious implementation reuses ``src/database/lakebase.py``, and it cannot:
-psycopg 3.3.4 SIGABRTs a serverless kernel inside libpq AT IMPORT TIME, exit code 134, before any
-of our code runs (see the note in ``requirements-databricks.txt``). A workflow task that imports it
-does not fail, it dies. So this module never imports that one, and
-``tests/test_import_boundaries.py`` enforces it. The four connection facts are read from config and
-env instead — duplicating four strings is the cheap side of that trade.
+THE TRANSPORT IS LAKEHOUSE FEDERATION, and it is the second one this task has had. Both dead ends
+are recorded because each is a wall a reader would otherwise walk into again:
 
-THE MECHANISM, verified against the installed databricks-sdk 0.125.0 rather than recalled:
+1. NOT psycopg. The obvious implementation reuses ``src/database/lakebase.py``, and it cannot:
+   psycopg 3.3.4 SIGABRTs a serverless kernel inside libpq AT IMPORT TIME, exit code 134, before
+   any of our code runs (see ``requirements-databricks.txt``). A task that imports it does not
+   fail, it dies. This module never imports that one and
+   ``tests/test_import_boundaries.py`` enforces it.
+2. NOT Spark JDBC either, which is what this task shipped with and what never once worked.
+   Serverless compute CANNOT RESOLVE THE LAKEBASE ENDPOINT'S HOSTNAME — a pre-flight isolated it
+   to DNS, not to credentials, not to TLS, and not to the driver. The design assumption behind the
+   JDBC version was that a minted OAuth token plus ``sslmode=require`` was the whole problem;
+   the problem was that there is no route from that compute to that host at all. Bundling a
+   connector to work around it hits workspace policy, which is the same wall wearing a hat.
+3. SO THE READ GOES THROUGH UNITY CATALOG. Lakehouse Federation exposes Postgres as a foreign
+   catalog — ``regime_lakebase`` over connection ``regime_lakebase_conn`` — and the read is then
+   ordinary ``spark.sql`` against a three-level name. The routing is the workspace's problem
+   rather than ours, which is exactly why it works where JDBC did not.
 
-1. ``WorkspaceClient().postgres.generate_database_credential(endpoint=...)`` returns a
-   ``DatabaseCredential`` with a ``token`` field — an OAuth token usable as a Postgres password.
-   This is a plain HTTPS call; nothing in the SDK imports a Postgres driver.
-2. The SDK offers NO Spark integration for Postgres — ``PostgresAPI`` manages infrastructure and
-   mints credentials, and its own docstring points at "direct SQL connections" for data. So the
-   read is plain Spark JDBC (``spark.read.format("jdbc")``) with the PostgreSQL driver that
-   Databricks Runtime ships, the minted token as the password, and ``sslmode=require``.
-3. The token is short-lived and minted per run, so nothing is stored and rule 5 holds.
+WHAT FEDERATION COSTS, stated plainly: a UC connection stores a STATIC credential, and the OAuth
+tokens this task used to mint expire hourly, so the connection cannot use one. It authenticates as
+a native Postgres role ``federation_reader`` with SELECT only on ``market_system`` and a password
+held in the connection object — a role that exists solely because of that constraint, and whose
+blast radius is bounded to reading the two tables below. No password appears in this repository
+and rule 5 still holds.
 
-IF JDBC IS BLOCKED IN YOUR WORKSPACE — serverless egress rules or a missing driver — the fallback
-is the APP-SIDE SYNC, and this module is shaped so that swapping to it changes one function. The
-transport is the injected ``read`` callable; everything after it (:func:`history_rows`, the
-watermark read, the MERGE) is transport-agnostic and takes plain dicts. The app-side version reads
-the same two tables through ``src/database/lakebase.py`` — psycopg works in the app container,
-where it is already proven — and writes through ``src/database/delta.py`` over the SQL warehouse,
-which executes a MERGE as happily as a SELECT. It would run on the app's startup path or behind a
-button on the agent page rather than in the job, which costs the daily cadence and keeps the
-capability. It is deliberately NOT implemented as a second live code path: two syncs writing the
-same two tables on different schedules is a worse failure than one sync that has to be triggered
-from the app.
+THE DELTA WRITE SIDE IS UNCHANGED by any of this, which was the point of shaping the transport as
+an injected ``read`` callable: everything after it (:func:`history_rows`, the watermark read, the
+MERGE) takes plain dicts and did not move when the transport was replaced.
 
 WATERMARK, NOT FULL RELOAD. Each target's own ``MAX(watermark column)`` is the cursor — no cursor
 table, because a stored cursor and the rows it describes are two things that can disagree, and the
@@ -48,7 +48,6 @@ a fact even after AMD is removed. The app reads Lakebase when it wants the curre
 from __future__ import annotations
 
 import logging
-import os
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
@@ -68,18 +67,13 @@ from src.pipelines import (
 
 __all__ = [
     "HISTORY_TABLES",
-    "SECRET_KEYS",
-    "SECRET_SCOPE",
     "TASK_NAME",
+    "FederatedSource",
     "HistoryTable",
-    "LakebaseConnection",
-    "access_token",
-    "connection_from_config",
-    "env_from_secrets",
     "history_rows",
-    "jdbc_options",
     "main",
     "read_source",
+    "source_from_config",
     "source_query",
     "sync_table",
     "watermark",
@@ -89,37 +83,26 @@ log = logging.getLogger(__name__)
 
 TASK_NAME = "sync_lakebase_history"
 
-#: The JDBC driver Databricks Runtime ships. Named explicitly so a missing driver fails with the
-#: class name in the message rather than as "no suitable driver found for jdbc:postgresql".
-JDBC_DRIVER = "org.postgresql.Driver"
-
-#: Where the host and the role come from when they are kept out of the repository. The scope is the
-#: one A-0 created for the Massive key; these two keys are added alongside it.
-SECRET_SCOPE = "capstone"
-
-#: secret key -> the env name it stands in for, so one mechanism reads both. A serverless notebook
-#: task cannot be given environment variables, which is what makes the secret scope the only way to
-#: supply these without committing them.
-SECRET_KEYS: Mapping[str, str] = {
-    "lakebase_host": "PGHOST",
-    "lakebase_user": "PGUSER",
-}
+#: The Postgres schema behind the foreign catalog. Federation preserves it, so the three-level name
+#: is catalog.market_system.<table> and not a flattened one.
+DEFAULT_SCHEMA = "market_system"
 
 
 @dataclass(frozen=True)
-class LakebaseConnection:
-    """The non-secret facts needed to reach Lakebase. The password is never one of them."""
+class FederatedSource:
+    """Where Postgres appears inside Unity Catalog.
 
-    host: str
-    database: str
-    user: str
-    endpoint: str
-    port: int = 5432
-    schema: str = "market_system"
+    Two strings, and neither is a credential: the foreign catalog is a UC object, and everything
+    about reaching the database — host, port, TLS, the ``federation_reader`` password — lives in
+    the connection behind it, configured once in the workspace. That is the entire reason this
+    replaced the JDBC version, which needed all of those here and could not reach the host anyway.
+    """
 
-    def jdbc_url(self) -> str:
-        """``sslmode=require`` is not optional: this connection crosses the public internet."""
-        return f"jdbc:postgresql://{self.host}:{self.port}/{self.database}?sslmode=require"
+    catalog: str
+    schema: str = DEFAULT_SCHEMA
+
+    def table_fqn(self, table: "HistoryTable") -> str:
+        return f"{self.catalog}.{self.schema}.{table.source}"
 
 
 @dataclass(frozen=True)
@@ -175,136 +158,38 @@ HISTORY_TABLES: tuple[HistoryTable, ...] = (
 )
 
 
-def connection_from_config(
-    config: Mapping,
-    env: Mapping[str, str] | None = None,
-) -> LakebaseConnection:
-    """Connection facts from the ``lakebase`` config block, with env vars taking precedence.
+def source_from_config(config: Mapping) -> FederatedSource:
+    """Read ``lakebase.federated_catalog`` and ``lakebase.schema``.
 
-    Env first because a job's cluster environment is where a workspace-specific host belongs, and
-    config as the checked-in default so a fresh clone has something to correct rather than a
-    KeyError to debug. The names match the app's (``PGHOST`` and friends), so one Lakebase project
-    is described the same way wherever it is read from.
+    No environment-variable override, unlike the connection facts this replaced. Those described a
+    network route, which is a per-workspace thing an operator should be able to correct without a
+    commit; this names a Unity Catalog object, and a job pointed at a foreign catalog that does not
+    exist should say so rather than silently read a different one.
     """
-    env = os.environ if env is None else env
     section = dict(config.get("lakebase") or {})
+    catalog = str(section.get("federated_catalog") or "")
 
-    def pick(key: str, *env_names: str, default: str = "") -> str:
-        for name in env_names:
-            value = env.get(name)
-            if value:
-                return str(value)
-        value = section.get(key)
-        return str(value) if value else default
-
-    connection = LakebaseConnection(
-        host=pick("host", "PGHOST", "LAKEBASE_HOST"),
-        database=pick("database", "PGDATABASE", default="databricks_postgres"),
-        user=pick("user", "PGUSER"),
-        endpoint=pick("endpoint", "LAKEBASE_ENDPOINT"),
-        port=int(pick("port", "PGPORT", default="5432")),
-        schema=pick("schema", "PGSCHEMA", default="market_system"),
+    if not catalog:
+        raise ValueError(
+            f"{TASK_NAME}: lakebase.federated_catalog is not set in config/config.yaml. It is the "
+            "Unity Catalog foreign catalog over the Lakebase Postgres connection; the sync reads "
+            "through federation because serverless compute cannot resolve the Postgres host."
+        )
+    return FederatedSource(
+        catalog=catalog,
+        schema=str(section.get("schema") or DEFAULT_SCHEMA),
     )
 
-    missing = [
-        name
-        for name, value in (
-            ("host", connection.host),
-            ("user", connection.user),
-            ("endpoint", connection.endpoint),
-        )
-        if not value
-    ]
-    if missing:
-        raise ValueError(
-            f"{TASK_NAME}: lakebase {', '.join(missing)} not configured. Put them in the "
-            f"`{SECRET_SCOPE}` secret scope as "
-            f"{' / '.join(sorted(SECRET_KEYS))} (see env_from_secrets), or in "
-            "config/config.yaml under `lakebase:`, or as PGHOST / PGUSER / LAKEBASE_ENDPOINT in "
-            "the environment."
-        )
-    return connection
 
-
-def env_from_secrets(
-    secret_getter: Callable[[str, str], str],
-    scope: str = SECRET_SCOPE,
-    keys: Mapping[str, str] = SECRET_KEYS,
-) -> dict[str, str]:
-    """Read the connection facts from a secret scope, shaped as the ``env`` mapping above takes.
-
-    WHY A SECRET SCOPE FOR VALUES THAT ARE NOT SECRETS. The host and the Postgres role are not
-    credentials — the password is an OAuth token minted per run and never stored — but they are
-    workspace infrastructure, and this repository is public. A serverless notebook task cannot be
-    handed environment variables, so the choice is: commit them, or read them from the scope that
-    A-0 already created for the Massive key. This is that second option.
-
-    ``secret_getter`` is ``dbutils.secrets.get``, passed in rather than imported, because dbutils
-    exists only inside a workspace and this module has to stay importable and testable outside one.
-
-    A MISSING SECRET IS NOT AN ERROR HERE. It is skipped, and the value falls through to config or
-    to a real environment variable; if nothing supplies it, connection_from_config raises with a
-    message naming all three places to look. Failing in this function instead would replace that
-    complete diagnosis with "no such secret", which is only one of the three answers.
-    """
-    resolved: dict[str, str] = {}
-    for secret_key, env_name in keys.items():
-        try:
-            value = secret_getter(scope, secret_key)
-        except Exception as exc:  # noqa: BLE001 — dbutils raises workspace-specific types
-            log.info(
-                "secret %s/%s unavailable (%s); falling back to config",
-                scope,
-                secret_key,
-                type(exc).__name__,
-            )
-            continue
-        if value:
-            resolved[env_name] = str(value)
-    return resolved
-
-
-def access_token(connection: LakebaseConnection, workspace_client: Any = None) -> str:
-    """Mint a short-lived Postgres password through the Databricks SDK.
-
-    The import is local so this module stays importable — and testable — on a machine with no SDK
-    configuration, which is also how the fake-backed tests avoid a workspace.
-    """
-    client = workspace_client
-    if client is None:
-        from databricks.sdk import WorkspaceClient
-
-        client = WorkspaceClient()
-
-    credential = client.postgres.generate_database_credential(endpoint=connection.endpoint)
-    token = getattr(credential, "token", None)
-    if not token:
-        raise RuntimeError(
-            f"{TASK_NAME}: generate_database_credential returned no token for endpoint "
-            f"{connection.endpoint!r}"
-        )
-    return str(token)
-
-
-def jdbc_options(connection: LakebaseConnection, token: str) -> dict[str, str]:
-    """The ``spark.read.format("jdbc")`` options. The token is a value here, never a URL fragment."""
-    return {
-        "url": connection.jdbc_url(),
-        "driver": JDBC_DRIVER,
-        "user": connection.user,
-        "password": token,
-    }
-
-
-def source_query(table: HistoryTable, schema: str, since: datetime | None) -> str:
-    """The Postgres SELECT, with the watermark pushed down to the database.
+def source_query(table: HistoryTable, source: FederatedSource, since: datetime | None) -> str:
+    """The SELECT, with the watermark in a WHERE so federation can push it down to Postgres.
 
     Pushed down rather than filtered in Spark because the point of a watermark is to not transfer
     the rows again — filtering after the read would move the whole table across the wire every day
-    to throw most of it away.
+    to throw most of it away. Federation forwards a predicate this simple to the database.
     """
     projection = ", ".join(table.columns)
-    sql = f"SELECT {projection} FROM {schema}.{table.source}"
+    sql = f"SELECT {projection} FROM {source.table_fqn(table)}"
     if since is not None:
         sql += f" WHERE {table.watermark_column} >= {_timestamp_literal(since)}"
     return sql
@@ -323,24 +208,22 @@ def watermark(spark: Any, catalog: str, table: HistoryTable) -> datetime | None:
 
 def read_source(
     spark: Any,
-    connection: LakebaseConnection,
+    source: FederatedSource,
     table: HistoryTable,
     since: datetime | None,
-    token: str,
 ) -> list[dict]:
-    """Read one Postgres table over JDBC and return plain dicts.
+    """Read one Postgres table through the foreign catalog and return plain dicts.
+
+    ONE ``spark.sql`` AGAINST A THREE-LEVEL NAME is the whole transport. There is no driver here,
+    no URL, no credential and no token: Unity Catalog holds all of that in the connection behind
+    the foreign catalog, which is why this reaches a host that JDBC from the same compute could
+    not even resolve.
 
     Collected to the driver deliberately: this is a watchlist and a report log, tens of rows, and
     plain dicts are what :func:`merge_rows` takes and what a test can fake without Spark.
     """
-    options = jdbc_options(connection, token)
-    frame = (
-        spark.read.format("jdbc")
-        .options(**options)
-        .option("query", source_query(table, connection.schema, since))
-        .load()
-    )
-    return [{column: row[column] for column in table.columns} for row in frame.collect()]
+    rows = spark.sql(source_query(table, source, since)).collect()
+    return [{column: row[column] for column in table.columns} for row in rows]
 
 
 def history_rows(
@@ -358,10 +241,9 @@ def history_rows(
 def sync_table(
     spark: Any,
     catalog: str,
-    connection: LakebaseConnection,
+    source: FederatedSource,
     table: HistoryTable,
     *,
-    token: str,
     captured_at: datetime,
     read: Callable[..., Sequence[Mapping]] = read_source,
 ) -> dict:
@@ -370,8 +252,8 @@ def sync_table(
     require_table(spark, target_fqn)
 
     since = watermark(spark, catalog, table)
-    source = read(spark, connection, table, since, token)
-    rows = history_rows(source, table, captured_at)
+    fetched = read(spark, source, table, since)
+    rows = history_rows(fetched, table, captured_at)
 
     merged = merge_rows(
         spark,
@@ -392,33 +274,29 @@ def main(
     config: Mapping,
     *,
     catalog: str | None = None,
-    workspace_client: Any = None,
-    connection: LakebaseConnection | None = None,
+    source: FederatedSource | None = None,
     read: Callable[..., Sequence[Mapping]] = read_source,
-    env: Mapping[str, str] | None = None,
 ) -> dict:
     """Capture both Lakebase tables into Delta (spec C-6).
 
-    One token for the run, one ``captured_at`` for the run, one ``bronze.ingestion_runs`` row for
-    the run. A shared ``captured_at`` matters: it is what makes "these rows arrived in the same
-    sync" a readable fact rather than a millisecond coincidence.
+    One ``captured_at`` for the run and one ``bronze.ingestion_runs`` row for the run. A shared
+    ``captured_at`` matters: it is what makes "these rows arrived in the same sync" a readable fact
+    rather than a millisecond coincidence.
     """
     catalog = catalog or str(config["catalog"])
-    connection = connection or connection_from_config(config, env)
+    source = source or source_from_config(config)
 
     run = RunRecord(run_id=new_run_id(), task=TASK_NAME, started_at=utc_now())
     captured_at = utc_now()
     results: list[dict] = []
 
     try:
-        token = access_token(connection, workspace_client)
         for table in HISTORY_TABLES:
             result = sync_table(
                 spark,
                 catalog,
-                connection,
+                source,
                 table,
-                token=token,
                 captured_at=captured_at,
                 read=read,
             )
@@ -443,15 +321,20 @@ def main(
 
 
 def _timestamp_literal(value: datetime) -> str:
-    """A Postgres TIMESTAMPTZ literal from a ``datetime``, and from nothing else.
+    """A Databricks SQL TIMESTAMP literal from a ``datetime``, and from nothing else.
 
-    The type check is the security control, the same as in ``news_recent``: the JDBC ``query``
-    option is text with no parameter markers, so this is what keeps a value from becoming SQL.
+    Space-separated rather than ISO-8601's ``T``, because this literal is now parsed by Databricks
+    on its way to being pushed down and that is the form its documented grammar takes. The offset
+    is kept: the Postgres columns are TIMESTAMPTZ and a literal without a zone would be read in
+    the session's.
+
+    The type check is the security control, the same as in ``news_recent``: this SQL is text with
+    no parameter markers, so this is what keeps a value from becoming SQL.
     """
     if not isinstance(value, datetime):
         raise TypeError(f"expected a datetime, got {type(value).__name__}: {value!r}")
     moment = value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
-    return f"TIMESTAMP '{moment.astimezone(timezone.utc).isoformat()}'"
+    return f"TIMESTAMP '{moment.astimezone(timezone.utc).isoformat(sep=' ')}'"
 
 
 def _as_datetime(value: Any) -> datetime:

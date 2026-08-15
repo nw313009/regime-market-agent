@@ -102,27 +102,39 @@ news_recent:
   include_backfill: false
 
 lakebase:
-  # Added at C-6 for sync_lakebase_history, which reaches Postgres over Spark JDBC.
+  # THESE ARE NOT SECRETS and none of them may become one. There is no password key here and there
+  # must never be one.
   #
-  # THESE ARE NOT SECRETS and none of them may become one. The password is an OAuth token minted
-  # per run through databricks-sdk (w.postgres.generate_database_credential), never stored.
+  # THE SYNC READS THROUGH LAKEHOUSE FEDERATION, not over the network directly. Added at C-6 as a
+  # Spark JDBC connection and amended once it turned out that serverless compute cannot resolve the
+  # Lakebase endpoint's hostname at all — a DNS wall, not a credential problem, so no amount of
+  # correct connection facts below would ever have fixed it. Unity Catalog exposes Postgres as the
+  # foreign catalog named here, and sync_lakebase_history is then an ordinary three-level-name
+  # spark.sql read. The routing is the workspace's problem instead of ours.
   #
-  # The job cannot import src/database/lakebase.py to get these — that module imports psycopg,
-  # which SIGABRTs a serverless kernel (see requirements-databricks.txt) — so the connection facts
-  # live here, where a job and the app can both read them without sharing a driver.
+  # These two keys are the ones the job actually reads (src/pipelines/lakebase_history.py):
+  federated_catalog: regime_lakebase
+  schema: market_system
+  # ^ the foreign catalog is backed by connection `regime_lakebase_conn`, which authenticates as
+  #   the native Postgres role `federation_reader` (SELECT-only on market_system) with a static
+  #   password held in the connection object. A native role rather than the app's service
+  #   principal because a UC connection stores its credential once and OAuth tokens expire hourly.
   #
-  # HOST AND USER ARE DELIBERATELY EMPTY HERE and come from the `capstone` secret scope instead,
-  # as keys `lakebase_host` and `lakebase_user`. Not because they are secrets — they are not — but
-  # because this repository is public and they are workspace infrastructure. A serverless notebook
-  # task cannot be given environment variables, so a scope is the only way to supply them without
-  # committing them; notebooks/20_daily_run.py reads them through
-  # src/pipelines/lakebase_history.env_from_secrets. Filling them in here still works and wins
-  # nothing over the scope — resolution order is env var, then secret, then this file.
+  # EVERYTHING BELOW DESCRIBES THE APP'S CONNECTION, and no code reads it. The app is the other
+  # Lakebase client — psycopg from the app container, credentials from app.yaml's PG* env — and
+  # this is kept as the record of what it connects to, in the one file that describes the project's
+  # data plumbing. Deleting it would lose that; treating it as configuration would be a fiction.
+  #
+  # A kind note for whoever traces the history: the `capstone` secret scope still holds
+  # lakebase_host and lakebase_user, wired in at f4a07f1 so a serverless task (which cannot be
+  # given environment variables) could reach Postgres without committing workspace infrastructure
+  # to a public repo. That wiring worked exactly as intended and is now unnecessary — the transport
+  # it fed was the one that could not resolve the host. The reader was removed with the JDBC code;
+  # the secrets are harmless and can stay.
   host: ""
   port: 5432
   database: databricks_postgres
   user: ""
-  schema: market_system
   endpoint: projects/regime-market-database/branches/production/endpoints/primary
 
 workflow:
