@@ -33,6 +33,7 @@ from src.llm.call_model import ModelResponse, ToolCall, call_model
 CONFIG = {
     "catalog": "market_intel",
     "news": {"half_life_days": 2},
+    "forecast": {"horizon_days": 5},
     "model": {"agent_endpoint": "databricks-meta-llama-3-3-70b-instruct"},
 }
 
@@ -432,6 +433,7 @@ def test_the_prompt_states_every_rule_the_spec_requires():
     assert "market research explainer" in prompt
     assert "CALL get_market_forecast BEFORE MAKING ANY QUANTITATIVE CLAIM" in prompt
     assert "NEVER INVENT A NUMBER" in prompt
+    assert "AND SO DO YOU" in prompt
     assert "NAME THE TITLES" in prompt
     assert "NEVER GIVE INVESTMENT ADVICE" in prompt
     assert "CONFIRM EVERY WRITE" in prompt
@@ -455,3 +457,70 @@ def test_a_fractional_half_life_still_reads_naturally():
 
 def test_the_prompt_falls_back_when_the_config_has_no_half_life():
     assert "2-trading-day half-life" in system_prompt(config={"catalog": "market_intel"})
+
+
+class TestHorizonRule:
+    """The rule added after a live session found the gap between "no numbers" and "no advice".
+
+    Asked about a MONTH, the agent invented no figure and gave no advice — and then explained how
+    to extrapolate the 5-day returns to get one. Methodology was covered by neither rule.
+    """
+
+    def test_the_horizon_comes_from_config_not_from_the_template(self):
+        # Typed into the prompt, it would drift the day forecast.horizon_days changes — the same
+        # reason the half-life is interpolated, and the same silent failure.
+        assert "{horizon_days}" in SYSTEM_PROMPT_TEMPLATE
+        assert "5-TRADING-DAY HORIZON" in system_prompt(config=CONFIG)
+        assert "10-TRADING-DAY HORIZON" in system_prompt(
+            config={**CONFIG, "forecast": {"horizon_days": 10}}
+        )
+
+    def test_every_horizon_mention_moves_together(self):
+        """One typed-in "5-day" left behind would contradict the rule in the same prompt."""
+        prompt = system_prompt(config={**CONFIG, "forecast": {"horizon_days": 10}})
+
+        assert "5-day" not in prompt
+        assert "5-trading-day" not in prompt.lower()
+        assert "10-day horizon" in prompt
+
+    def test_it_falls_back_when_the_config_has_no_horizon(self):
+        """A prompt silent on scope is exactly the failure this rule exists for."""
+        assert "5-TRADING-DAY HORIZON" in system_prompt(config={"catalog": "market_intel"})
+
+    def test_the_forbidden_methods_are_named_one_by_one(self):
+        """"Do not extrapolate" alone leaves annualizing and compounding looking permitted."""
+        prompt = system_prompt(config=CONFIG).lower()
+
+        for method in ("extrapolat", "scaling", "annualiz", "compounding"):
+            assert method in prompt
+
+    def test_it_closes_the_offer_to_let_the_user_do_the_arithmetic(self):
+        """The exact evasion observed: no number written, a recipe for one handed over."""
+        # Unwrapped, so re-flowing the paragraph cannot fail this on a line break.
+        prompt = " ".join(system_prompt(config=CONFIG).split())
+
+        assert "something the user could do themselves" in prompt
+        assert "A method you suggest is a number you caused" in prompt
+        assert "describing how to manufacture a figure the system did not produce" in prompt
+
+    def test_the_rule_answers_the_question_rather_than_refusing_it(self):
+        """Declining the horizon is the point; declining to explain anything is not."""
+        prompt = " ".join(system_prompt(config=CONFIG).split())
+
+        assert "then answer what the 5-day data does show" in prompt
+
+    def test_it_sits_with_the_other_data_scope_rule(self):
+        """Rule 3 is rule 2's family — a reader who stops after "never invent a number" has it."""
+        prompt = system_prompt(config=CONFIG)
+
+        assert prompt.index("NEVER INVENT A NUMBER") < prompt.index("AND SO DO YOU")
+        assert prompt.index("AND SO DO YOU") < prompt.index("GROUND EVERY NEWS CLAIM")
+
+    def test_the_rules_are_numbered_without_a_gap(self):
+        """Inserting a rule mid-list is where a renumber gets forgotten."""
+        numbers = [
+            int(line.split(".", 1)[0])
+            for line in system_prompt(config=CONFIG).splitlines()
+            if line[:1].isdigit() and ". " in line[:4]
+        ]
+        assert numbers == list(range(1, len(numbers) + 1))
