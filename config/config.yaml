@@ -49,6 +49,10 @@ backtest:
   # Refuse to fit with fewer observations than this.
   min_train_days: 252
   origin_freq: weekly
+  # 26 origins is the cheap re-run setting for Free Edition compute. The evaluation reported in
+  # README.md and stored in gold.backtest_summary was run at 51 weekly origins (n=255 per model,
+  # 765 metric rows across 3 models, computed 2026-08-10). Re-running at 26 produces a smaller,
+  # different evaluation — it does not reproduce the reported numbers.
   n_weeks: 26
 
 model:

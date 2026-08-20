@@ -1,0 +1,8 @@
+Screenshots referenced by README.md. Git does not track empty directories, so this
+placeholder holds the path until the PNGs land; delete it once they are committed.
+
+  app-forecast-card.png       the app: regime cards, forecast percentiles, evaluation table
+  agent-horizon-decline.png   the horizon guardrail refusing a monthly prediction
+  agent-citations.png         grounded citations naming publishers
+  workflow-8-green.png        the 8-task daily workflow, all green
+  cdc-history-row.png         a watchlist row captured into Delta by the watermark sync

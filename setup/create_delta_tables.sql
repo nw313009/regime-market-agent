@@ -362,6 +362,11 @@ COMMENT 'Walk-forward backtest scores. MERGE on (origin_date, ticker, model) —
 -- n IS MANDATORY ON THE PAGE. 26 weekly origins across 5 tickers is 130 forecasts per model, which
 -- is a small sample for a Brier difference. "No meaningful improvement detected at this sample
 -- size" is a first-class verdict (spec A2), and it cannot be stated honestly without n.
+--
+-- THE STORED EVALUATION IS NOT THAT RUN. The numbers README.md reports came from 51 weekly origins
+-- (n=255 per model, 765 metric rows across 3 models, computed 2026-08-10). config's
+-- backtest.n_weeks was lowered to 26 afterwards to keep re-runs cheap on Free Edition, so a re-run
+-- produces a smaller, different evaluation — it does not reproduce the reported numbers.
 CREATE TABLE IF NOT EXISTS market_intel.gold.backtest_summary (
   model         STRING NOT NULL COMMENT 'news_markov | markov | gbm. MERGE key: one current pooled row per model, replaced by the next backtest run.',
   n             BIGINT          COMMENT 'Scored (origin, ticker) forecasts behind these numbers. ALWAYS displayed on the Model Evaluation page.',
