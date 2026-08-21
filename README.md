@@ -79,15 +79,6 @@ Two boundaries in these diagrams were earned the hard way (see
   therefore reads Postgres through a Lakehouse Federation foreign catalog
   (a dedicated `federation_reader` role, SELECT-only), not JDBC.
 
-## Screenshots
-
-| | |
-|---|---|
-| ![Forecast and regime cards](docs/images/app-forecast-card.png) | **The app.** Regime probabilities, forecast percentiles, and the evaluation table, read from Gold over a serverless SQL warehouse. |
-| ![Agent declines beyond-horizon question](docs/images/agent-horizon-decline.png) | **The horizon guardrail.** Asked for a monthly prediction, the agent states the 5-day boundary and reports what the data does show — it does not propose extrapolation. This rule exists because an earlier version did. |
-| ![Agent cites news sources](docs/images/agent-citations.png) | **Grounded citations.** Asked what news drives the sentiment, the agent searches the index and attributes each claim to a named publisher. |
-| ![Workflow 8/8 green](docs/images/workflow-8-green.png) | **Daily orchestration.** The 8-task workflow: ingestion → silver → features → models → index sync → CDC. |
-| ![CDC history row](docs/images/cdc-history-row.png) | **Change data capture.** A watchlist row written to Postgres, captured into Delta by the watermark sync — the two timestamps are the CDC lag. |
 
 ## Findings (the interesting parts)
 
