@@ -8,9 +8,7 @@ to invent them.
 
 `Python` · `PySpark` · `SQL` · `Databricks` · `Delta Lake` · `Lakebase (Postgres)` · `AI Search` · `Lakehouse Federation` · `Streamlit`
 
-Built with AI-assisted development (Cursor). Every design decision, test, and
-commit was reviewed and driven by me — the failure history in the git log is
-the development process, not an accident.
+Built with AI-assisted development using Cursor. I reviewed the generated code, defined the architecture and constraints, and validated changes through tests and deployed runs.
 
 **Author:** Writam Nanda · [LinkedIn](https://www.linkedin.com/in/writam-nanda-0bba19410/) · [GitHub](https://github.com/nw313009)
 
