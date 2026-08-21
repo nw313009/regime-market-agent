@@ -8,6 +8,10 @@ WHAT THIS PAGE ADDS TO THE LOOP:
 
 - The ticker scope. It is prepended to the question rather than left to the model to infer, so
   "why is downside risk elevated?" reaches the tools with a symbol attached.
+- Three starter questions, because an empty chat box is a worse demo than a bad answer: nobody
+  watching knows what this agent is for until they see the kind of question it takes. A click
+  parks the text in session state and the rerun feeds it through :func:`ask`, the same path a
+  typed question takes.
 - The tool activity trail. Every turn shows which tools ran — "checked the forecast", "searched
   news" — because an explanation whose provenance is invisible is indistinguishable from a
   fabricated one. :func:`tool_activity` is a pure function and is tested directly.
@@ -52,6 +56,23 @@ TOOL_LABELS = {
 HISTORY_KEY = "agent_history"
 TRANSCRIPT_KEY = "agent_transcript"
 LAST_RESULT_KEY = "agent_last_result"
+PENDING_KEY = "agent_pending_question"
+
+#: The three starter questions, one per thing this agent is actually for: explaining a number it
+#: read, citing the articles behind a sentiment signal, and naming its own limits. An empty chat box
+#: is a worse demo than a bad answer — nobody watching knows what to type, so the third question in
+#: particular is the horizon rule's shop window.
+SUGGESTED_QUESTIONS = (
+    "Why is this forecast positive?",
+    "What recent news is driving sentiment?",
+    "What can't this forecast tell me?",
+)
+
+#: What this thing is, in the words the product will stand behind, next to where the user types.
+AGENT_CAPTION = (
+    "Explains this system's data, grounded in the forecast tables and indexed news. It does not "
+    "give investment advice."
+)
 
 
 # ------------------------------------------------------------------ pure functions
@@ -126,8 +147,23 @@ def state() -> tuple[list[dict], list[dict]]:
 
 
 def reset_conversation() -> None:
-    for key in (HISTORY_KEY, TRANSCRIPT_KEY, LAST_RESULT_KEY):
+    for key in (HISTORY_KEY, TRANSCRIPT_KEY, LAST_RESULT_KEY, PENDING_KEY):
         st.session_state.pop(key, None)
+
+
+def queue_question(question: str) -> None:
+    """A suggestion click becomes the next rerun's question.
+
+    ``st.chat_input`` cannot be filled programmatically, so the button parks the text in session
+    state and the rerun picks it up. The turn then runs through :func:`ask` exactly as a typed
+    question does — one code path into the agent, not a second one for buttons.
+    """
+    st.session_state[PENDING_KEY] = question
+
+
+def take_pending_question() -> str | None:
+    """Pop the queued question. POP, not read: a rerun must not ask the same thing twice."""
+    return st.session_state.pop(PENDING_KEY, None)
 
 
 def ask(ticker: str, question: str) -> AgentResult:
@@ -152,12 +188,14 @@ def render() -> None:
     ticker = _render_sidebar()
     st.caption(
         f"Scoped to **{ticker}**. The agent reads `gold.forecast_runs`, `gold.regime_states` and "
-        "the news index. It does not compute statistics and does not give advice."
+        "the news index. It computes no statistics of its own."
     )
 
     _render_transcript()
+    _render_suggestions()
 
-    question = st.chat_input(f"Ask about {ticker}")
+    typed = st.chat_input(f"Ask about {ticker}")
+    question = typed or take_pending_question()
     if question:
         with st.chat_message("user"):
             st.write(question)
@@ -183,6 +221,15 @@ def _render_transcript() -> None:
 def _render_activity(activity: Sequence[str]) -> None:
     if activity:
         st.caption("· ".join(activity))
+
+
+def _render_suggestions() -> None:
+    """Three one-click questions, above the input, with the disclaimer beside them."""
+    for column, question in zip(st.columns(len(SUGGESTED_QUESTIONS)), SUGGESTED_QUESTIONS):
+        if column.button(question, use_container_width=True, key=f"suggested::{question}"):
+            queue_question(question)
+            st.rerun()
+    st.caption(AGENT_CAPTION)
 
 
 def _render_sidebar() -> str:

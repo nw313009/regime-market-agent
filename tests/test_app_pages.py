@@ -21,6 +21,7 @@ from __future__ import annotations
 import ast
 import dataclasses
 import importlib
+import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -263,6 +264,26 @@ class TestFormatting:
         assert common.number(5000) == "5,000"
         assert common.money(None) == common.MISSING
 
+    def test_fixed_is_the_one_way_a_bare_decimal_reaches_a_screen(self):
+        """Brier scores and coverage rates. Inline f-strings are how one figure gets two roundings."""
+        assert common.fixed(0.25301, 4) == "0.2530"
+        assert common.fixed(0.816) == "0.82"
+        assert common.fixed(None) == common.MISSING
+        assert common.fixed(float("nan")) == common.MISSING
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [(1, 1.0), ("2.5", 2.5), (None, None), ("abc", None), (float("nan"), None)],
+    )
+    def test_as_float_answers_is_there_a_number_here(self, value, expected):
+        """NaN comes back None on purpose: a NaN that survives fails silently in a `<` comparison."""
+        assert common.as_float(value) == expected
+
+    def test_the_horizon_comes_from_config_like_the_half_life(self):
+        assert common.horizon_days() == 5
+        assert common.horizon_days({"forecast": {"horizon_days": 10}}) == 10
+        assert common.horizon_days({"catalog": "market_intel"}) == 5
+
     def test_the_decay_disclosure_states_the_configured_half_life(self):
         """Interpolated from config, so changing the config cannot leave the page lying."""
         assert "2-trading-day half-life" in common.decay_disclosure()
@@ -366,6 +387,331 @@ class TestResearchAgentPage:
         from src.agent import tools as agent_tools
 
         assert {tool.name for tool in agent_tools.TOOLS} == set(research_agent.TOOL_LABELS)
+
+
+#: The words no UI string may contain (spec: the app explains, it does not advise). Matched on word
+#: BOUNDARIES, not substrings — "threshold" contains "hold" and "held up" contains neither, and a
+#: naive `in` check would either fail on the first or miss nothing useful.
+BANNED_UI_WORDS = ("consider", "opportunity", "entry", "buy", "sell", "hold")
+
+
+def assert_no_advice_words(text: str) -> None:
+    found = [word for word in BANNED_UI_WORDS if re.search(rf"\b{word}\w*\b", text, re.IGNORECASE)]
+    assert not found, f"UI copy contains advice words {found}: {text!r}"
+
+
+def forecast_row(**overrides) -> dict:
+    """One ``gold.forecast_runs`` row, with the columns the redesigned cards read."""
+    row = {
+        "forecast_id": "forecast-123",
+        "as_of_date": "2026-08-11",
+        "horizon_days": 5,
+        "model_used": "news_markov",
+        "current_price": 100.0,
+        "price_p10": 94.0,
+        "price_p50": 100.5,
+        "price_p90": 108.0,
+        "return_p10": -0.060,
+        "return_p50": 0.005,
+        "return_p90": 0.080,
+        "prob_positive": 0.540,
+        "prob_loss_gt_5pct": 0.151,
+        "prob_low_vol": 0.983,
+        "prob_high_vol": 0.017,
+        "n_paths": 5000,
+    }
+    row.update(overrides)
+    return row
+
+
+class TestHeadlineCard:
+    """The first line a reader sees is assembled from bands, so the bands are what get pinned."""
+
+    @pytest.mark.parametrize(
+        ("probability", "expected"),
+        [
+            (0.10, market_research.LEANING_NEGATIVE),
+            (0.449, market_research.LEANING_NEGATIVE),
+            (0.45, market_research.COIN_FLIP),
+            (0.50, market_research.COIN_FLIP),
+            (0.55, market_research.COIN_FLIP),
+            (0.551, market_research.LEANING_POSITIVE),
+            (0.97, market_research.LEANING_POSITIVE),
+        ],
+    )
+    def test_the_direction_phrase_cuts_at_the_declared_bands(self, probability, expected):
+        assert market_research.direction_phrase(probability) == expected
+
+    def test_a_fifty_four_percent_forecast_is_not_called_positive(self):
+        """The reason the bands exist. 54% is a coin flip a reader could otherwise act on."""
+        assert market_research.direction_phrase(0.54) == market_research.COIN_FLIP
+
+    def test_a_missing_probability_has_no_phrase_rather_than_a_neutral_one(self):
+        assert market_research.direction_phrase(None) is None
+        assert market_research.direction_phrase(float("nan")) is None
+
+    def test_the_regime_badge_names_the_dominant_regime_and_its_tone(self):
+        calm, tone = market_research.regime_badge({"prob_low_vol": 0.983, "prob_high_vol": 0.017})
+        assert calm == "Calm market · 98.3%"
+        assert tone == market_research.CALM
+
+        turbulent, tone = market_research.regime_badge({"prob_low_vol": 0.27, "prob_high_vol": 0.73})
+        assert turbulent == "Turbulent market · 73.0%"
+        assert tone == market_research.TURBULENT
+
+    def test_a_gbm_day_gets_an_honest_badge_rather_than_zeros(self):
+        badge, tone = market_research.regime_badge({"prob_low_vol": None, "prob_high_vol": None})
+
+        assert badge == "Regime unknown"
+        assert tone == market_research.UNKNOWN
+        assert market_research.regime_badge(None)[1] == market_research.UNKNOWN
+
+    def test_the_verdict_carries_the_band_and_the_regime(self):
+        text = market_research.headline_verdict(forecast_row(), {"prob_low_vol": 0.98, "prob_high_vol": 0.02})
+
+        assert market_research.COIN_FLIP in text
+        assert "calm" in text
+        assert "5 trading days" in text
+
+    def test_the_regime_changes_the_colour_not_the_wording(self):
+        """Only the tone word differs. A sentence that gets more alarming has an opinion."""
+        calm = market_research.headline_verdict(forecast_row(), {"prob_low_vol": 0.9, "prob_high_vol": 0.1})
+        turbulent = market_research.headline_verdict(forecast_row(), {"prob_low_vol": 0.1, "prob_high_vol": 0.9})
+
+        assert calm.replace("calm", "X") == turbulent.replace("turbulent", "X")
+
+    def test_it_falls_back_to_the_forecast_row_when_there_is_no_regime_row(self):
+        """``forecast_runs`` carries the same two probabilities, so a missing regime row is not blank."""
+        text = market_research.headline_verdict(forecast_row(), None)
+        assert "calm" in text
+
+    def test_a_gbm_day_says_the_regime_could_not_be_estimated(self):
+        row = forecast_row(prob_low_vol=None, prob_high_vol=None)
+        assert "could not estimate" in market_research.headline_verdict(row, None)
+
+    def test_no_forecast_and_no_probability_each_say_so(self):
+        assert "No forecast has been computed" in market_research.headline_verdict(None)
+        assert "no direction probability" in market_research.headline_verdict(
+            forecast_row(prob_positive=None)
+        )
+
+    def test_the_metric_label_takes_the_horizon_from_the_row(self):
+        assert market_research.direction_label(forecast_row()) == "Positive 5-day return"
+        assert market_research.direction_label(forecast_row(horizon_days=10)) == (
+            "Positive 10-day return"
+        )
+
+    def test_the_horizon_falls_back_to_config_when_the_row_omits_it(self):
+        assert market_research.forecast_horizon(forecast_row(horizon_days=None)) == 5
+        assert market_research.forecast_horizon(None) == 5
+
+
+class TestRangeCard:
+    def test_each_percentile_carries_a_price_and_a_signed_return(self):
+        rows = market_research.range_rows(forecast_row())
+
+        assert [row["label"] for row in rows] == [
+            "Low · 10th percentile",
+            "Median",
+            "High · 90th percentile",
+        ]
+        assert rows[0]["price"] == "$94.00"
+        assert rows[0]["return"] == "-6.0%"
+        assert rows[2]["return"] == "+8.0%"
+
+    def test_no_forecast_produces_no_rows(self):
+        assert market_research.range_rows(None) == []
+
+    def test_the_band_marker_sits_where_the_median_falls(self):
+        assert market_research.band_offset(
+            forecast_row(price_p10=90.0, price_p50=100.0, price_p90=110.0)
+        ) == pytest.approx(50.0)
+        assert market_research.band_offset(
+            forecast_row(price_p10=90.0, price_p50=92.0, price_p90=110.0)
+        ) == pytest.approx(10.0)
+
+    def test_a_degenerate_band_draws_no_bar_rather_than_a_pinned_marker(self):
+        assert market_research.band_offset(forecast_row(price_p90=94.0)) is None
+        assert market_research.band_offset(forecast_row(price_p50=None)) is None
+        assert market_research.band_offset(None) is None
+
+    def test_the_downside_line_is_the_plainest_wording_available(self):
+        assert market_research.loss_line(forecast_row()) == (
+            "Chance of losing more than 5%: 15.1%."
+        )
+        assert "not recorded" in market_research.loss_line(forecast_row(prob_loss_gt_5pct=None))
+
+    def test_the_caption_says_what_the_three_numbers_are(self):
+        assert market_research.distribution_caption(forecast_row()) == (
+            "Distribution across 5,000 simulated paths at a 5-trading-day horizon."
+        )
+
+    def test_an_unrecorded_path_count_is_stated_rather_than_guessed(self):
+        caption = market_research.distribution_caption(forecast_row(n_paths=None))
+        assert "unrecorded number of simulated paths" in caption
+
+
+class TestTrustStory:
+    """Three lines a user can act on, from the stored evaluation, naming no model."""
+
+    @staticmethod
+    def evaluation(**overrides) -> list[dict]:
+        """The frozen run: n=255 over 51 weekly origins, arms tied, fallback halved."""
+        shared = {"n": 255, "n_tickers": 5, "coverage_80": 0.82} | overrides
+        return [
+            pooled("news_markov", 0.25301, fallback_rate=0.0745, **shared),
+            pooled("markov", 0.25335, fallback_rate=0.1686, **shared),
+            pooled("gbm", 0.25374, fallback_rate=0.0, **shared),
+        ]
+
+    def test_no_line_names_a_model(self):
+        """The whole point. "news_markov vs markov vs gbm" belongs in the README, not the app."""
+        lines = " ".join(model_evaluation.trust_lines(self.evaluation(), forecast_row()))
+
+        for name in ("news_markov", "markov", "gbm", "Model A", "Model B", "Model C"):
+            assert name.lower() not in lines.lower()
+
+    def test_the_sample_line_derives_the_week_count_from_n(self):
+        """255 forecasts over 5 tickers is 51 weekly origins — derived, never a second column."""
+        line = model_evaluation.trust_lines(self.evaluation())[0]
+
+        assert "255 historical forecasts" in line
+        assert "51 weeks" in line
+        assert "5 tickers" in line
+
+    def test_a_tie_reads_as_statistically_equivalent(self):
+        line = model_evaluation.trust_lines(self.evaluation())[0]
+        assert "statistically equivalent" in line
+
+    def test_a_real_improvement_is_not_reported_as_a_tie(self):
+        rows = self.evaluation()
+        rows[0] = pooled("news_markov", 0.15, n=255, n_tickers=5, fallback_rate=0.0745)
+
+        assert "scored better" in model_evaluation.trust_lines(rows)[0]
+
+    def test_the_reliability_line_compares_against_the_alternative_not_the_baseline(self):
+        """gbm's fallback rate is 0 by construction; comparing to it would be arithmetic, not a finding.
+
+        Asserted through :func:`common.pct` rather than against a typed-in "7.5%": the point of the
+        test is WHICH arm is on the other side of the comparison, and pinning the rendering of
+        0.0745 here would make this test fail the day the formatter's precision changes.
+        """
+        lines = model_evaluation.trust_lines(self.evaluation())
+        reliability = next(line for line in lines if "reliability" in line)
+
+        assert common.pct(0.0745) in reliability
+        assert common.pct(0.1686) in reliability, "the alternative's rate, not the baseline's"
+        assert common.pct(0.0) not in reliability, "gbm's zero must not be the comparison"
+        assert "less than half as often" in reliability
+
+    def test_the_reliability_line_is_omitted_when_it_would_not_be_true(self):
+        rows = self.evaluation()
+        rows[0] = pooled("news_markov", 0.253, n=255, n_tickers=5, fallback_rate=0.30)
+
+        assert not [line for line in model_evaluation.trust_lines(rows) if "reliability" in line]
+
+    def test_the_coverage_line_reports_the_measured_span(self):
+        rows = self.evaluation()
+        rows[1] = pooled("markov", 0.25335, n=255, n_tickers=5, coverage_80=0.839, fallback_rate=0.1686)
+
+        line = next(l for l in model_evaluation.trust_lines(rows) if "coverage" in l)
+
+        assert "0.82–0.84" in line
+        assert "hit their 80% coverage target" in line
+
+    def test_coverage_off_target_is_not_described_as_hitting_it(self):
+        line = next(
+            l for l in model_evaluation.trust_lines(self.evaluation(coverage_80=0.62)) if "coverage" in l
+        )
+
+        assert "hit" not in line
+        assert "0.62" in line and "against an 80% coverage target" in line
+
+    def test_a_fallback_forecast_says_so(self):
+        lines = model_evaluation.trust_lines(self.evaluation(), forecast_row(model_used="gbm"))
+        assert "Today's forecast used the fallback model." in lines
+
+    def test_the_production_model_earns_no_notice(self):
+        lines = model_evaluation.trust_lines(self.evaluation(), forecast_row())
+        assert not [line for line in lines if "fallback model" in line]
+
+    def test_an_unvalidated_forecast_says_it_is_unvalidated(self):
+        lines = model_evaluation.trust_lines([], forecast_row())
+
+        assert len(lines) == 1
+        assert "has not been validated yet" in lines[0]
+
+    def test_a_missing_baseline_does_not_claim_a_tie_against_it(self):
+        """verdict() calls a missing arm indistinguishable; that is not a tie anyone measured."""
+        rows = [pooled("news_markov", 0.253, n=255, n_tickers=5)]
+
+        assert "no simpler baseline scored" in model_evaluation.trust_lines(rows)[0]
+
+    def test_it_points_at_the_readme_for_the_names_it_withholds(self):
+        assert model_evaluation.README_URL.startswith("https://github.com/")
+
+
+class TestSuggestedQuestions:
+    def test_there_are_three_and_they_ask_about_this_system(self):
+        assert len(research_agent.SUGGESTED_QUESTIONS) == 3
+        assert any("news" in question.lower() for question in research_agent.SUGGESTED_QUESTIONS)
+        assert any(
+            "can't" in question.lower() or "cannot" in question.lower()
+            for question in research_agent.SUGGESTED_QUESTIONS
+        )
+
+    def test_a_click_queues_the_question_and_taking_it_consumes_it(self, monkeypatch):
+        """Popped, not read: a Streamlit rerun must not re-ask the same thing."""
+        monkeypatch.setattr(research_agent.st, "session_state", {})
+
+        research_agent.queue_question("Why is this forecast positive?")
+        assert research_agent.take_pending_question() == "Why is this forecast positive?"
+        assert research_agent.take_pending_question() is None
+
+    def test_resetting_the_conversation_drops_a_queued_question(self, monkeypatch):
+        monkeypatch.setattr(research_agent.st, "session_state", {})
+
+        research_agent.queue_question("What recent news is driving sentiment?")
+        research_agent.reset_conversation()
+
+        assert research_agent.take_pending_question() is None
+
+
+class TestUiCopyGivesNoAdvice:
+    """Spec A2 as a test: this product explains, and the words it explains with are checked."""
+
+    def test_the_suggested_questions_and_the_caption_are_clean(self):
+        for question in research_agent.SUGGESTED_QUESTIONS:
+            assert_no_advice_words(question)
+        assert_no_advice_words(research_agent.AGENT_CAPTION)
+        assert "does not give investment advice" in research_agent.AGENT_CAPTION
+
+    @pytest.mark.parametrize("probability", [0.10, 0.50, 0.90])
+    def test_every_headline_verdict_band_is_clean(self, probability):
+        for regime in ({"prob_low_vol": 0.9, "prob_high_vol": 0.1}, {"prob_low_vol": 0.1, "prob_high_vol": 0.9}, None):
+            assert_no_advice_words(
+                market_research.headline_verdict(forecast_row(prob_positive=probability), regime)
+            )
+
+    def test_the_range_card_copy_is_clean(self):
+        assert_no_advice_words(market_research.loss_line(forecast_row()))
+        assert_no_advice_words(market_research.distribution_caption(forecast_row()))
+        for row in market_research.range_rows(forecast_row()):
+            assert_no_advice_words(row["label"])
+
+    def test_the_trust_lines_are_clean(self):
+        rows = TestTrustStory.evaluation()
+        for line in model_evaluation.trust_lines(rows, forecast_row(model_used="gbm")):
+            assert_no_advice_words(line)
+
+    def test_the_word_check_would_actually_catch_something(self):
+        """A banned-word test that cannot fail is decoration."""
+        with pytest.raises(AssertionError):
+            assert_no_advice_words("This looks like a good entry.")
+        with pytest.raises(AssertionError):
+            assert_no_advice_words("Consider buying.")
+        # And does not fire on words that merely contain one.
+        assert_no_advice_words("accuracy held up against the threshold")
 
 
 @pytest.fixture(scope="module")

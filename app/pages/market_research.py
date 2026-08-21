@@ -1,9 +1,22 @@
 """Market Research page (spec A2, C-5).
 
-Select a ticker; see its price history, the regime the model currently believes it is in, the
-five-day forecast distribution, and the news that fed it. Every number is READ from Gold. This
-page computes no statistics — if a number is not in ``gold.regime_states`` or
-``gold.forecast_runs``, it is not shown.
+Select a ticker; read, in this order, what the forecast says, how wide it is, and why any of it
+should be believed. Every number is READ from Gold. This page computes no statistics — if a number
+is not in ``gold.regime_states``, ``gold.forecast_runs`` or ``gold.backtest_summary``, it is not
+shown.
+
+THE ORDER IS THE ARGUMENT. The headline card answers the question in one assembled sentence, the
+range card says how uncertain that answer is, and the trust block says what the answer has been
+measured against — then the price chart, the regime parameters and the article list, which are the
+evidence a reader goes looking for once the first three have earned the attention. The earlier
+layout led with a year of price history, which is the one thing on the page the system did not
+produce.
+
+NO MODEL NAME REACHES THE TRUST BLOCK. "news_markov vs markov vs gbm" is an implementation detail
+of the evaluation; a reader of a single forecast needs the sample size, the outcome and the
+reliability facts, and the arm names live in the Model Evaluation page and the README. The lines
+themselves are built in :mod:`app.pages.model_evaluation`, which already owns that table and the
+statistics over it.
 
 TWO THINGS ARE STATED EVEN WHEN THEY ARE INCONVENIENT:
 
@@ -13,8 +26,9 @@ TWO THINGS ARE STATED EVEN WHEN THEY ARE INCONVENIENT:
   the press is indifferent about produce the same sentiment number and mean completely different
   things, and the tone line says which one this is.
 
-A GBM DAY HAS NO REGIME CARD. When the ladder falls back to Model A there are no regimes, the
-daily task writes no ``regime_states`` row, and the page says so instead of rendering zeros.
+A GBM DAY HAS NO REGIME. When the ladder falls back to Model A there are no regimes, the daily task
+writes no ``regime_states`` row, and the badge and the verdict both say so instead of rendering
+zeros. The trust block adds its own line when the day's forecast came from a fallback rung.
 
 The pure functions at the top are what the tests exercise: they turn a Gold row into the sentence
 the card shows, with no Streamlit and no warehouse anywhere near them.
@@ -39,17 +53,24 @@ from app.common import (  # noqa: E402
     MISSING,
     WAREHOUSE_HINT,
     as_datetime,
+    as_float,
     age_phrase,
     catalog,
     decay_disclosure,
+    fixed,
+    horizon_days,
     money,
     number,
     pct,
     seed_tickers,
 )
+from app.pages import model_evaluation  # noqa: E402
 from src.database import delta  # noqa: E402
 
 TITLE = "Market Research"
+
+#: The trust block's heading, in the words a reader would use for the question it answers.
+TRUST_TITLE = "How much to trust this"
 
 #: How much price history the chart shows. A year of sessions is enough to see the regime the
 #: model is talking about without turning the chart into a decade of scenery.
@@ -145,6 +166,166 @@ def sentiment_marker(label: Any) -> str:
     return SENTIMENT_MARKERS.get(str(label or "").strip().lower(), "•")
 
 
+# ------------------------------------------------------------------ the headline
+#
+# WHAT A READER SEES FIRST IS ONE SENTENCE, AND IT IS ASSEMBLED, NOT WRITTEN. The verdict is a
+# template filled from two bands — the direction probability and the regime — so it cannot drift
+# into a recommendation, cannot hedge differently on two days with the same numbers, and cannot say
+# anything the tables do not support. No free text reaches this line and no model generates it.
+
+
+#: The bands the direction phrase is cut at. A 54% chance of a positive return is not "positive":
+#: it is barely off a coin flip, and the first line a user reads has to say that rather than
+#: rounding a near-tie into a direction they will act on.
+COIN_FLIP_FLOOR = 0.45
+COIN_FLIP_CEILING = 0.55
+
+LEANING_POSITIVE = "leaning positive"
+LEANING_NEGATIVE = "leaning negative"
+COIN_FLIP = "close to a coin flip"
+
+CALM = "calm"
+TURBULENT = "turbulent"
+UNKNOWN = "unknown"
+
+#: Badge text per tone. The tone drives the colour and nothing else — a turbulent market is styled
+#: amber because it is worth noticing, not because the wording changes.
+REGIME_BADGES = {
+    CALM: "Calm market",
+    TURBULENT: "Turbulent market",
+    UNKNOWN: "Regime unknown",
+}
+
+
+def direction_phrase(prob: Any) -> str | None:
+    """Which band the direction probability falls in, or ``None`` when there is no probability."""
+    value = as_float(prob)
+    if value is None:
+        return None
+    if value < COIN_FLIP_FLOOR:
+        return LEANING_NEGATIVE
+    return COIN_FLIP if value <= COIN_FLIP_CEILING else LEANING_POSITIVE
+
+
+def regime_badge(row: Mapping[str, Any] | None) -> tuple[str, str]:
+    """``("Calm market · 98.3%", "calm")`` — the badge text and the tone that colours it.
+
+    Works on a ``gold.regime_states`` row or a ``gold.forecast_runs`` row, since both carry the two
+    filtered probabilities. A gbm day has neither and gets the honest badge rather than zeros.
+    """
+    low = as_float((row or {}).get("prob_low_vol"))
+    high = as_float((row or {}).get("prob_high_vol"))
+    if low is None and high is None:
+        return REGIME_BADGES[UNKNOWN], UNKNOWN
+
+    low_value = low or 0.0
+    high_value = high or 0.0
+    tone = TURBULENT if high_value >= low_value else CALM
+    dominant = high_value if tone == TURBULENT else low_value
+    return f"{REGIME_BADGES[tone]} · {pct(dominant)}", tone
+
+
+def direction_label(forecast: Mapping[str, Any] | None = None) -> str:
+    """The lead metric's label. The horizon comes from the row or config, never from prose."""
+    return f"Positive {number(forecast_horizon(forecast))}-day return"
+
+
+def forecast_horizon(forecast: Mapping[str, Any] | None = None) -> int:
+    """The horizon this forecast actually used, falling back to the configured one."""
+    stored = as_float((forecast or {}).get("horizon_days"))
+    return int(stored) if stored else horizon_days()
+
+
+def headline_verdict(
+    forecast: Mapping[str, Any] | None,
+    regime: Mapping[str, Any] | None = None,
+) -> str:
+    """The one assembled sentence. Bands in, plain English out, no advice verb anywhere."""
+    if not forecast:
+        return "No forecast has been computed for this ticker yet."
+
+    phrase = direction_phrase(forecast.get("prob_positive"))
+    if phrase is None:
+        return "This forecast carries no direction probability, so there is nothing to summarize."
+
+    days = number(forecast_horizon(forecast))
+    _, tone = regime_badge(regime if regime else forecast)
+    if tone == UNKNOWN:
+        return (
+            f"Over the next {days} trading days the distribution is {phrase}, in a market whose "
+            "regime the model could not estimate for this day."
+        )
+    return (
+        f"Over the next {days} trading days the distribution is {phrase}, in a market the model "
+        f"currently reads as {tone}."
+    )
+
+
+# ------------------------------------------------------------------ the range
+
+
+#: The three percentiles the card shows, as (label, price column, return column). p10 and p90 are
+#: the ends of the 80% interval the backtest scores coverage against, so they are the two the
+#: trust block's coverage line is about — the same interval, named the same way in both places.
+RANGE_ROWS = (
+    ("Low · 10th percentile", "price_p10", "return_p10"),
+    ("Median", "price_p50", "return_p50"),
+    ("High · 90th percentile", "price_p90", "return_p90"),
+)
+
+
+def range_rows(forecast: Mapping[str, Any] | None) -> list[dict]:
+    """Each percentile as a price AND a return, in one row rather than two separate blocks.
+
+    A price alone makes a reader do arithmetic against today's close; a percentage alone hides what
+    the position is actually worth. Both, side by side, is the whole point of the card.
+    """
+    if not forecast:
+        return []
+    return [
+        {
+            "label": label,
+            "price": money(forecast.get(price_key)),
+            "return": pct(forecast.get(return_key), signed=True),
+        }
+        for label, price_key, return_key in RANGE_ROWS
+    ]
+
+
+def band_offset(forecast: Mapping[str, Any] | None) -> float | None:
+    """Where the median sits between the two ends, 0–100, for the visual band's marker.
+
+    ``None`` when the band would be degenerate (missing ends, or p90 not above p10), which is the
+    signal to draw the numbers without the bar rather than a bar with the marker pinned at zero.
+    """
+    low = as_float((forecast or {}).get("price_p10"))
+    mid = as_float((forecast or {}).get("price_p50"))
+    high = as_float((forecast or {}).get("price_p90"))
+    if low is None or mid is None or high is None or high <= low:
+        return None
+    return max(0.0, min(100.0, (mid - low) / (high - low) * 100.0))
+
+
+def loss_line(forecast: Mapping[str, Any] | None) -> str:
+    """The downside in the plainest words available. Analysis, not a recommendation."""
+    probability = as_float((forecast or {}).get("prob_loss_gt_5pct"))
+    if probability is None:
+        return "Chance of losing more than 5%: not recorded for this forecast."
+    return f"Chance of losing more than 5%: {pct(probability)}."
+
+
+def distribution_caption(forecast: Mapping[str, Any] | None) -> str:
+    """What the three numbers ARE. A percentile without its sample size is not interpretable."""
+    if not forecast:
+        return ""
+    paths = forecast.get("n_paths")
+    counted = "an unrecorded number of" if paths is None else number(paths)
+    return (
+        f"Distribution across {counted} simulated paths at a "
+        f"{number(forecast_horizon(forecast))}-trading-day horizon."
+    )
+
+
 # ------------------------------------------------------------------ reads
 
 
@@ -236,13 +417,90 @@ def render() -> None:
         st.caption(f"{type(exc).__name__}: {exc}")
         return
 
+    # TOP TO BOTTOM IS THE ARGUMENT: what the forecast says, how wide it is, and why any of it
+    # should be believed. The price history and the article list are evidence a reader goes looking
+    # for afterwards, so they sit below the three cards rather than competing with them.
+    _render_headline(forecast, regime)
+    _render_range(forecast)
+    _render_trust(forecast)
     _render_price_chart(ticker, prices)
-    left, right = st.columns(2)
-    with left:
-        _render_regime(regime)
-    with right:
-        _render_forecast(forecast)
+    _render_regime_detail(regime)
     _render_news(news)
+
+
+def _render_headline(
+    forecast: Mapping[str, Any] | None,
+    regime: Mapping[str, Any] | None,
+) -> None:
+    """Direction, regime, and the assembled sentence — the whole answer, above the fold."""
+    if not forecast:
+        st.warning(headline_verdict(None))
+        st.caption(forecast_caption(None))
+        return
+
+    badge, tone = regime_badge(regime if regime else forecast)
+    direction, market = st.columns(2)
+    direction.metric(direction_label(forecast), pct(forecast.get("prob_positive")))
+    market.metric("Market regime", badge)
+
+    # Amber for turbulent. The wording is identical either way — the colour is the only thing the
+    # regime changes, because a sentence that gets more alarming is a sentence with an opinion.
+    banner = st.warning if tone == TURBULENT else st.info
+    banner(headline_verdict(forecast, regime))
+    st.caption(forecast_caption(forecast))
+
+
+def _render_range(forecast: Mapping[str, Any] | None) -> None:
+    st.subheader("The range")
+    rows = range_rows(forecast)
+    if not rows:
+        return
+
+    for column, row in zip(st.columns(len(rows)), rows):
+        # delta_color="off": a red or green arrow next to a percentile reads as a signal, and the
+        # percentile is not one. It is one end of an interval.
+        column.metric(row["label"], row["price"], row["return"], delta_color="off")
+
+    offset = band_offset(forecast)
+    if offset is not None:
+        st.markdown(_band_html(offset), unsafe_allow_html=True)
+
+    st.write(loss_line(forecast))
+    st.caption(distribution_caption(forecast))
+    st.info(decay_disclosure())
+
+
+def _band_html(offset: float) -> str:
+    """The 80% interval as one bar with the median marked, in plain HTML.
+
+    No chart library: the whole figure is two divs, and adding a plotting dependency to the app
+    container for a single horizontal bar would be a cold start paid on every page load.
+    """
+    return (
+        "<div style='margin:0.25rem 0 0.75rem 0'>"
+        "<div style='position:relative;height:10px;border-radius:5px;"
+        "background:linear-gradient(90deg,#f3b0b0,#e6e6e6,#a7dca7)'>"
+        f"<div style='position:absolute;left:{fixed(offset, 1)}%;top:-4px;width:2px;height:18px;"
+        "background:#111827'></div></div></div>"
+    )
+
+
+def _render_trust(forecast: Mapping[str, Any] | None) -> None:
+    """Open by default, because a number nobody has validated is the one a reader should doubt."""
+    try:
+        rows = model_evaluation.pooled_summary()
+    except Exception as exc:  # noqa: BLE001 — a missing evaluation must not take the page with it
+        with st.expander(TRUST_TITLE, expanded=False):
+            st.caption(f"The evaluation table could not be read. {type(exc).__name__}: {exc}")
+        return
+
+    with st.expander(TRUST_TITLE, expanded=True):
+        for line in model_evaluation.trust_lines(rows, forecast):
+            st.write(line)
+        st.caption(
+            "Model names and the evaluation in full are in the "
+            f"[project README]({model_evaluation.README_URL})."
+        )
 
 
 def _render_price_chart(ticker: str, prices: Sequence[Mapping[str, Any]]) -> None:
@@ -257,44 +515,27 @@ def _render_price_chart(ticker: str, prices: Sequence[Mapping[str, Any]]) -> Non
     st.caption(f"Last close {money(last.get('close'))} on {last.get('trade_date')}")
 
 
-def _render_regime(regime: Mapping[str, Any] | None) -> None:
-    st.subheader("Current regime")
-    st.metric("Filtered probability", regime_headline(regime))
-    if not regime:
+def _render_regime_detail(regime: Mapping[str, Any] | None) -> None:
+    """The regime parameters, folded away. The headline badge is what most readers need.
+
+    Collapsed rather than deleted: "0.31% mean daily return, 1.42% daily volatility" is the
+    evidence behind the badge, and a page that shows a regime without ever showing its numbers is
+    asking to be taken on faith.
+    """
+    with st.expander("Regime detail"):
+        st.metric("Filtered probability", regime_headline(regime))
+        if not regime:
+            st.caption(
+                "No `gold.regime_states` row. Either `fit_models` has not run for this ticker, or "
+                "the ladder fell back to gbm, which has no regimes."
+            )
+            return
+        st.caption(f"Model {regime.get('model_used', MISSING)} · as of {regime.get('as_of_date')}")
+        st.write(regime_detail(regime))
         st.caption(
-            "No `gold.regime_states` row. Either `fit_models` has not run for this ticker, or the "
-            "ladder fell back to gbm, which has no regimes."
+            f"News signal at the fit: {number(regime.get('current_news_signal'), 3)} "
+            "(the decayed 3-day sentiment the model conditioned on)."
         )
-        return
-    st.caption(f"Model {regime.get('model_used', MISSING)} · as of {regime.get('as_of_date')}")
-    st.write(regime_detail(regime))
-    st.caption(
-        f"News signal at the fit: {number(regime.get('current_news_signal'), 3)} "
-        "(the decayed 3-day sentiment the model conditioned on)."
-    )
-
-
-def _render_forecast(forecast: Mapping[str, Any] | None) -> None:
-    st.subheader("Five-day forecast")
-    if not forecast:
-        st.caption(forecast_caption(None))
-        return
-
-    low, mid, high = st.columns(3)
-    low.metric("P10 return", pct(forecast.get("return_p10"), 1, signed=True))
-    mid.metric("P50 return", pct(forecast.get("return_p50"), 1, signed=True))
-    high.metric("P90 return", pct(forecast.get("return_p90"), 1, signed=True))
-
-    up, down = st.columns(2)
-    up.metric("P(return > 0)", pct(forecast.get("prob_positive"), 0))
-    down.metric("P(loss > 5%)", pct(forecast.get("prob_loss_gt_5pct"), 0))
-
-    st.caption(forecast_caption(forecast))
-    st.caption(
-        f"Price range {money(forecast.get('price_p10'))} – {money(forecast.get('price_p90'))} "
-        f"from {money(forecast.get('current_price'))}."
-    )
-    st.info(decay_disclosure())
 
 
 def _render_news(news: Sequence[Mapping[str, Any]]) -> None:

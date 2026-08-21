@@ -74,6 +74,16 @@ def half_life_days(cfg: Mapping[str, Any] | None = None) -> float:
     return float((source.get("news") or {}).get("half_life_days", 2))
 
 
+def horizon_days(cfg: Mapping[str, Any] | None = None) -> int:
+    """The forecast horizon, for copy that names it. Config, never typed into a sentence.
+
+    Same reason as the half-life: a page that says "five-day" in prose starts lying the day
+    ``forecast.horizon_days`` changes, and nothing fails when it does.
+    """
+    source = cfg or config()
+    return int((source.get("forecast") or {}).get("horizon_days", 5))
+
+
 def decay_disclosure(half_life: float | None = None) -> str:
     """THE DISCLOSURE SENTENCE (spec A2). Rendered on the forecast, not tucked into a footer.
 
@@ -101,6 +111,22 @@ def _number(value: float) -> str:
 MISSING = "—"
 
 
+def as_float(value: Any) -> float | None:
+    """Whatever the warehouse handed back, as a float — or ``None`` if it is not a usable number.
+
+    NaN comes back as ``None`` on purpose. Every formatter and every band comparison below wants
+    the same answer to "is there a number here", and a NaN that survives the coercion is a value
+    that formats as text and then fails silently in a ``<`` comparison.
+    """
+    if value is None:
+        return None
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    return None if result != result else result
+
+
 def pct(value: Any, digits: int = 1, *, signed: bool = False) -> str:
     """A DECIMAL fraction as a percentage. Every number in gold is decimal (spec B-6)."""
     if value is None:
@@ -122,6 +148,19 @@ def number(value: Any, digits: int = 0) -> str:
     if value is None:
         return MISSING
     return f"{float(value):,.{digits}f}"
+
+
+def fixed(value: Any, digits: int = 2) -> str:
+    """A bare decimal at a fixed width — a Brier score, a coverage rate.
+
+    Here rather than in a page because it is the last of the four ways a number reaches a screen,
+    and an inline f-string with its own precision is how two pages start rounding one figure two
+    ways. Nothing renders a raw float.
+    """
+    if value is None:
+        return MISSING
+    result = float(value)
+    return MISSING if result != result else f"{result:.{digits}f}"
 
 
 def as_datetime(value: Any) -> datetime | None:

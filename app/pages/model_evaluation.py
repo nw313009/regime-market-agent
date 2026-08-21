@@ -41,11 +41,12 @@ import streamlit as st  # noqa: E402 — the path has to be set before the app i
 
 from app.common import (  # noqa: E402
     CACHE_TTL_SECONDS,
-    MISSING,
     WAREHOUSE_HINT,
     age_phrase,
     as_datetime,
+    as_float,
     catalog,
+    fixed,
     number,
     pct,
 )
@@ -147,8 +148,8 @@ def verdict(rows: Sequence[Mapping[str, Any]]) -> Verdict:
             baseline=BASELINE,
         )
 
-    challenger_brier = _as_float(challenger.get("brier"))
-    baseline_brier = _as_float(baseline.get("brier"))
+    challenger_brier = as_float(challenger.get("brier"))
+    baseline_brier = as_float(baseline.get("brier"))
     if challenger_brier is None or baseline_brier is None:
         return Verdict(
             case=INDISTINGUISHABLE,
@@ -160,11 +161,12 @@ def verdict(rows: Sequence[Mapping[str, Any]]) -> Verdict:
 
     spread = baseline_brier - challenger_brier
     threshold = threshold_for(n)
-    fallback = _as_float(challenger.get("fallback_rate")) or 0.0
+    fallback = as_float(challenger.get("fallback_rate")) or 0.0
 
     detail = (
-        f"Brier {challenger_brier:.4f} vs {baseline_brier:.4f} over n = {n} forecasts; "
-        f"the difference is {abs(spread):.4f} against a noise band of ±{threshold:.4f} "
+        f"Brier {fixed(challenger_brier, 4)} vs {fixed(baseline_brier, 4)} over "
+        f"n = {number(n)} forecasts; the difference is {fixed(abs(spread), 4)} against a noise "
+        f"band of ±{fixed(threshold, 4)} "
         f"(±sqrt(0.25 × 0.75 / n), a heuristic, not a significance test)."
     )
 
@@ -240,7 +242,7 @@ def table_rows(rows: Sequence[Mapping[str, Any]]) -> list[dict]:
             "Model": MODEL_LABELS.get(str(row.get("model")), str(row.get("model"))),
             "n": number(row.get("n")),
             "Tickers": number(row.get("n_tickers")),
-            "Brier": _fixed(row.get("brier"), 4),
+            "Brier": fixed(row.get("brier"), 4),
             "MAE": pct(row.get("mae"), 2),
             "80% coverage": pct(row.get("coverage_80"), 1),
             "Fallback rate": pct(row.get("fallback_rate"), 1),
@@ -249,19 +251,141 @@ def table_rows(rows: Sequence[Mapping[str, Any]]) -> list[dict]:
     ]
 
 
-def _fixed(value: Any, digits: int) -> str:
-    number_value = _as_float(value)
-    return MISSING if number_value is None else f"{number_value:.{digits}f}"
+# ------------------------------------------------------------------ the trust story
+#
+# THE ARM NAMES DO NOT APPEAR IN ANY OF THESE LINES. "news_markov vs markov vs gbm" tells a user
+# nothing they can act on — the names are an implementation detail of the evaluation, and the
+# evaluation in full, names included, is the table above and the README. What a reader of a single
+# forecast needs is narrower: how big the sample was, how the comparison came out, and the two
+# reliability facts. So these lines say "the production model" and "the alternative", and every
+# figure in them is read from gold.backtest_summary rather than typed in.
 
 
-def _as_float(value: Any) -> float | None:
-    if value is None:
+#: The arm the daily job runs, and the rung it falls back to. The reliability line compares exactly
+#: these two: gbm's fallback rate is 0 by construction (it is the bottom of the ladder and has no
+#: fit to fail), so comparing against it would be arithmetic dressed as a finding.
+PRODUCTION_MODEL = CHALLENGER
+ALTERNATIVE_MODEL = "markov"
+
+#: The interval the backtest scores coverage against is [return_p10, return_p90] — 80% by
+#: construction, not by configuration. The tolerance is what counts as hitting it from either
+#: side; over-coverage is as much a miss as under-coverage, so the band is symmetric.
+COVERAGE_TARGET = 0.80
+COVERAGE_TOLERANCE = 0.05
+
+#: Where the full evaluation lives, arm names and all.
+README_URL = "https://github.com/nw313009/regime-market-agent#findings-the-interesting-parts"
+
+
+def trust_lines(
+    rows: Sequence[Mapping[str, Any]],
+    forecast: Mapping[str, Any] | None = None,
+) -> list[str]:
+    """"How much to trust this", in plain words, from the stored evaluation.
+
+    Returns one line per fact that the table can actually support. A line whose numbers are absent
+    is omitted rather than rendered with a dash: this block is prose a user reads once, and
+    "it fails — as often as —" is worse than saying less.
+    """
+    indexed = by_model(rows)
+    if PRODUCTION_MODEL not in indexed:
+        return [
+            "This forecast has not been validated yet: the backtest has not been run, so there is "
+            "no measured accuracy to report."
+        ]
+
+    lines = [_sample_line(rows, indexed[PRODUCTION_MODEL])]
+    reliability = _reliability_line(indexed)
+    if reliability:
+        lines.append(reliability)
+    lines.append(_coverage_line(rows))
+    notice = _fallback_notice(forecast)
+    if notice:
+        lines.append(notice)
+    return lines
+
+
+def _sample_line(rows: Sequence[Mapping[str, Any]], production: Mapping[str, Any]) -> str:
+    n = int(production.get("n") or 0)
+    tickers = int(production.get("n_tickers") or 0)
+    if n <= 0:
+        return (
+            "The evaluation table reports no scored forecasts, so there is no measured accuracy "
+            "to report yet."
+        )
+
+    scope = f"Validated on {number(n)} historical forecasts"
+    if tickers > 0:
+        # Origins are weekly and every origin is scored for every ticker, so the week count is
+        # derivable rather than stored. Deriving it beats adding a column that could disagree.
+        scope += f" across {number(n // tickers)} weeks and {number(tickers)} tickers"
+    return f"{scope} — {_comparison_clause(rows)}."
+
+
+def _comparison_clause(rows: Sequence[Mapping[str, Any]]) -> str:
+    """The same verdict the table renders, in words that name no arm.
+
+    Reuses :func:`verdict` rather than re-deriving the call: two implementations of "is this
+    better" is how a headline and its evidence start disagreeing.
+    """
+    if BASELINE not in by_model(rows):
+        # verdict() reports INDISTINGUISHABLE when an arm is missing, which is the right value for
+        # a page that shows its own reasoning and the wrong word for a sentence that would then
+        # claim a tie against a baseline nobody scored.
+        return "with no simpler baseline scored alongside it for comparison"
+
+    case = verdict(rows).case
+    if case == BETTER:
+        return "accuracy scored better than the simpler alternatives"
+    if case == WORSE:
+        return "accuracy scored worse than the simpler alternatives"
+    return "accuracy held up against simpler alternatives, which tested as statistically equivalent"
+
+
+def _reliability_line(indexed: Mapping[str, Mapping[str, Any]]) -> str | None:
+    """Why the richer model ships even when the scores tie: it answers more often."""
+    production = as_float((indexed.get(PRODUCTION_MODEL) or {}).get("fallback_rate"))
+    alternative = as_float((indexed.get(ALTERNATIVE_MODEL) or {}).get("fallback_rate"))
+    if production is None or alternative is None or alternative <= 0:
         return None
-    try:
-        result = float(value)
-    except (TypeError, ValueError):
+
+    ratio = production / alternative
+    if ratio >= 1.0:
+        # The claim is that it fails LESS. If it does not, say nothing here rather than inventing
+        # a sentence that spins a worse number.
         return None
-    return None if result != result else result
+
+    if ratio < 0.5:
+        frequency = "less than half as often as the alternative"
+    elif ratio <= 0.65:
+        frequency = "about half as often as the alternative"
+    else:
+        frequency = "less often than the alternative"
+
+    return (
+        "The production model was chosen for reliability: it fails to produce a forecast "
+        f"{frequency} ({pct(production)} vs {pct(alternative)})."
+    )
+
+
+def _coverage_line(rows: Sequence[Mapping[str, Any]]) -> str:
+    measured = [value for value in (as_float(row.get("coverage_80")) for row in rows) if value is not None]
+    if not measured:
+        return "Interval coverage was not recorded by this backtest, so it is not reported here."
+
+    low, high = min(measured), max(measured)
+    span = fixed(low, 2) if low == high else f"{fixed(low, 2)}–{fixed(high, 2)}"
+    if all(abs(value - COVERAGE_TARGET) <= COVERAGE_TOLERANCE for value in measured):
+        return f"Forecast intervals hit their 80% coverage target ({span} measured)."
+    return f"Forecast intervals measured {span} against an 80% coverage target."
+
+
+def _fallback_notice(forecast: Mapping[str, Any] | None) -> str | None:
+    """Said plainly when today's row is not the model the trust lines just described."""
+    if not forecast:
+        return None
+    used = str(forecast.get("model_used") or "").strip().lower()
+    return None if not used or used == PRODUCTION_MODEL else "Today's forecast used the fallback model."
 
 
 # ------------------------------------------------------------------ reads
