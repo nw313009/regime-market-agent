@@ -524,3 +524,42 @@ class TestHorizonRule:
             if line[:1].isdigit() and ". " in line[:4]
         ]
         assert numbers == list(range(1, len(numbers) + 1))
+
+
+class TestSameTurnNewsGrounding:
+    """The clause added after the agent explained a forecast by its news signal without searching.
+
+    It broke no rule as written — the signal came from a tool result, and no article was named — so
+    the citation only arrived when the user asked a second time. A summary of articles is still a
+    claim about them.
+    """
+
+    def test_the_signal_alone_does_not_count_as_grounding(self):
+        # Unwrapped, so re-flowing the paragraph cannot fail this on a line break.
+        prompt = " ".join(system_prompt(config=CONFIG).split())
+
+        assert "call search_market_news in the same turn" in prompt
+        assert "the numeric signal alone is not news grounding" in prompt
+
+    def test_the_forecast_signal_is_named_as_a_trigger(self):
+        """"News claim" alone left the forecast's own signal looking like a number, not news."""
+        prompt = " ".join(system_prompt(config=CONFIG).split())
+
+        assert "leans on news sentiment or news conditioning" in prompt
+        assert "including citing the news signal from a forecast" in prompt
+
+    def test_it_lives_inside_the_news_grounding_rule(self):
+        """Rule 4's business. As its own rule it would read as a second, weaker citation rule."""
+        prompt = system_prompt(config=CONFIG)
+
+        assert (
+            prompt.index("GROUND EVERY NEWS CLAIM")
+            < prompt.index("call search_market_news in the same turn")
+            < prompt.index("NEVER GIVE INVESTMENT ADVICE")
+        )
+
+    def test_the_empty_search_answer_survives_the_insertion(self):
+        """The clause was spliced mid-rule; the sentence it was spliced before still has to be there."""
+        prompt = " ".join(system_prompt(config=CONFIG).split())
+
+        assert "no relevant recent news was found" in prompt

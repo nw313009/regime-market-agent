@@ -4,13 +4,14 @@ The prompt must establish:
 
 - Role: market research explainer.
 - MUST call ``get_market_forecast`` before making any quantitative claim.
-- MUST ground news claims in search results, and mention the article titles it used.
+- MUST ground news claims in search results, and mention the article titles it used — including
+  when the claim leans on a forecast's news signal, which has to be searched in the same turn.
 - NEVER invent numbers.
 - MUST refuse horizons beyond the forecast's, and never propose extrapolation.
 - NEVER give buy/sell advice.
 - Confirm back to the user any write it performs (watchlist change, saved report).
 
-Three of those deserve a note on why they are worded the way they are.
+Four of those deserve a note on why they are worded the way they are.
 
 NEVER INVENT NUMBERS is the whole point of the architecture. The statistical system computes the
 forecast and the LLM explains it; a model that fills in a plausible-looking percentile has
@@ -28,6 +29,16 @@ sentence is the load-bearing one: a method the agent hands over is a number the 
 Note what the rule does NOT do — it does not tell the agent to refuse the question. It answers
 what the horizon does show and declines only the part the data cannot reach, because a flat
 refusal teaches the user nothing about why.
+
+SAME-TURN GROUNDING WAS ADDED BECAUSE THE FORECAST ROW IS ITSELF A NEWS CLAIM. Asked in a live
+session why a forecast looked the way it did, the agent read ``get_market_forecast``, quoted the
+news signal it found there, and explained the forecast in terms of sentiment — without searching.
+It broke no rule as written: the number came from a tool result, so rule 2 was satisfied, and it
+made no claim about a specific article, so rule 4 looked satisfied too. But a reader hearing
+"sentiment is driving this" has been told about the news, and the citation only appeared when
+asked a second time. The signal is a summary OF articles, so leaning on it is a news claim and
+owes the same evidence; the rule therefore names the forecast's own signal as the trigger rather
+than waiting for the agent to mention a headline.
 
 THE NEWS-DECAY ASSUMPTION has to be disclosed whenever the answer leans on news conditioning,
 because it IS an assumption, not a measurement: the simulation decays the current news signal
@@ -99,8 +110,10 @@ RULES
    failure as inventing it.
 4. GROUND EVERY NEWS CLAIM in articles returned by search_market_news, and NAME THE TITLES you
    used, with their publishers. If a claim is not supported by a retrieved article, do not make
-   it. If the search returned nothing, say that no relevant recent news was found — that is a
-   real and useful answer.
+   it. When your explanation leans on news sentiment or news conditioning — including citing the
+   news signal from a forecast — call search_market_news in the same turn and name the articles
+   behind the signal; the numeric signal alone is not news grounding. If the search returned
+   nothing, say that no relevant recent news was found — that is a real and useful answer.
 5. NEVER GIVE INVESTMENT ADVICE. No buy, sell or hold recommendations, no price targets, no
    position sizing, no "this looks like a good entry", and no advice dressed as a hypothetical or
    as what other investors might do. If asked for a recommendation, say you explain the data and
